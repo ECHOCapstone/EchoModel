@@ -1,4 +1,4 @@
-"""ECHO 모델 서버 - 발음 평가(/analyze) + TTS(/tts).
+"""ECHO 모델 서버 - 발음 평가(/analyze) + G2P(/g2p) + TTS(/tts).
 
 Run:
     python serve.py \
@@ -7,10 +7,11 @@ Run:
         --host 0.0.0.0 --port 8001
 
 Endpoints:
-    GET  /healthz   서버/모델/TTS 가용 상태
+    GET  /healthz   서버/모델/TTS/G2P 가용 상태
     GET  /phonemes  학습된 음소 리스트
     POST /analyze   발음 평가 - perceived/canonical/peak_softmax/alignment/errors/per
     POST /score     기존 호환 - recognized 키 사용
+    POST /g2p       텍스트 → ARPAbet 음소 시퀀스 (CMUDict + OOV 신경망 폴백)
     POST /tts       텍스트 → mp3 음성 (gTTS)
     GET  /          데모 웹 UI
 """
@@ -33,6 +34,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from echo.inference import PronunciationScorer
+from echo.utils.g2p import G2P
 
 logger = logging.getLogger("echo.serve")
 
@@ -57,8 +59,8 @@ except Exception:
     gTTS = None  # type: ignore
     _TTS_AVAILABLE = False
 
-# lifespan 동안 유지되는 추론기 핸들과 부팅 설정.
-state: dict = {"scorer": None, "config": {}}
+# lifespan 동안 유지되는 추론기/G2P 핸들과 부팅 설정.
+state: dict = {"scorer": None, "g2p": None, "config": {}}
 
 
 def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
@@ -87,9 +89,16 @@ async def lifespan(app: FastAPI):
         phoneme_map_path=cfg["phoneme_map"],
         device=cfg["device"],
     )
-    logger.info("Scorer ready on %s (tts_available=%s)", state["scorer"].device, _TTS_AVAILABLE)
+    # G2P 는 모델과 동일한 phoneme_map 을 SSOT 로 공유한다. 모델이 인식할 수 있는
+    # 음소만 canonical 로 내보내야 정렬·오류 비교가 무결해진다.
+    state["g2p"] = G2P.from_phoneme_map(cfg["phoneme_map"])
+    logger.info(
+        "Scorer ready on %s (tts_available=%s, g2p_ready=True)",
+        state["scorer"].device, _TTS_AVAILABLE,
+    )
     yield
     state["scorer"] = None
+    state["g2p"] = None
 
 
 app = FastAPI(title="ECHO Pronunciation Server", lifespan=lifespan)
@@ -123,6 +132,7 @@ def healthz():
         "device": str(scorer.device) if scorer else None,
         "num_phonemes": len(scorer.phoneme_to_id) if scorer else None,
         "tts_available": _TTS_AVAILABLE,
+        "g2p_ready": state["g2p"] is not None,
     }
 
 
@@ -184,6 +194,26 @@ async def analyze(
         "errors": raw_result["errors"],
         "per": raw_result["per"],
         "duration_sec": raw_result["duration_sec"],
+    }
+
+
+@app.post("/g2p")
+async def g2p(text: str = Form(...)):
+    """텍스트(단어 또는 문장) 를 모델 인벤토리에 맞춘 ARPAbet 음소 시퀀스로 변환한다.
+
+    응답:
+        phonemes: 공백으로 이어 붙인 전체 음소 시퀀스. /analyze 의 canonical 인자에 그대로 사용.
+        words:    원문 단어와 그 단어의 음소 목록. UI 에서 단어별 강조에 사용.
+    """
+    converter = state["g2p"]
+    if converter is None:
+        raise HTTPException(503, "G2P not ready")
+    if not text or not text.strip():
+        raise HTTPException(400, "text is required")
+    entries = converter.convert(text)
+    return {
+        "phonemes": " ".join(p for entry in entries for p in entry.phonemes),
+        "words": [{"word": entry.word, "phonemes": entry.phonemes} for entry in entries],
     }
 
 
