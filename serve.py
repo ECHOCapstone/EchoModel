@@ -2,9 +2,10 @@
 
 Run:
     python serve.py \
-        --checkpoint experiments/wav2vec2-base/baseline/20260411_030102/checkpoints/best_mdd_f1.pth \
+        --checkpoint experiments/wav2vec2-base/film/20260506_004510/checkpoints/best_mdd_f1.pth \
         --phoneme-map data/phoneme_to_id.json \
         --host 0.0.0.0 --port 8001
+        -- device cuda
 
 Endpoints:
     GET  /healthz   서버/모델/TTS/G2P 가용 상태
@@ -177,15 +178,38 @@ async def score(
     return _score_upload(raw, canonical, keep_silence, audio.filename)
 
 
+# 영어 평균 발화 속도 (음소/초). 사용자 데이터에서 fine-tune 가능.
+# 이 값을 기준으로 expected_sec 을 계산하고 실제 duration 과 비율로 fast/normal/slow 를 분기한다.
+_PHONEMES_PER_SECOND_NORMAL = 14.0
+_FAST_RATIO_THRESHOLD = 0.6   # 실제 / 예상 < 0.6 이면 빠른 발화
+_SLOW_RATIO_THRESHOLD = 1.6   # 실제 / 예상 > 1.6 이면 느린 발화
+
+
+def _classify_speech_rate(canonical_phonemes: list, duration_sec: float) -> tuple[str, float]:
+    """canonical 음소 개수 대비 실제 duration 비율로 발화 속도 레이블을 정한다."""
+    if not canonical_phonemes or duration_sec <= 0.0:
+        return ("normal", 1.0)
+    expected_sec = max(0.2, len(canonical_phonemes) / _PHONEMES_PER_SECOND_NORMAL)
+    ratio = duration_sec / expected_sec
+    if ratio < _FAST_RATIO_THRESHOLD:
+        return ("fast", round(ratio, 2))
+    if ratio > _SLOW_RATIO_THRESHOLD:
+        return ("slow", round(ratio, 2))
+    return ("normal", round(ratio, 2))
+
+
 @app.post("/analyze")
 async def analyze(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
 ):
-    """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과."""
+    """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과 + 발화 속도 분류."""
     raw = await audio.read()
     raw_result = _score_upload(raw, canonical, keep_silence, audio.filename)
+    speech_rate, speech_rate_ratio = _classify_speech_rate(
+        raw_result["canonical"], raw_result["duration_sec"]
+    )
     return {
         "perceived": raw_result["recognized"],
         "canonical": raw_result["canonical"],
@@ -194,6 +218,8 @@ async def analyze(
         "errors": raw_result["errors"],
         "per": raw_result["per"],
         "duration_sec": raw_result["duration_sec"],
+        "speech_rate": speech_rate,
+        "speech_rate_ratio": speech_rate_ratio,
     }
 
 
