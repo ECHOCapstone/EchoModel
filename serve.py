@@ -210,6 +210,16 @@ async def analyze(
     speech_rate, speech_rate_ratio = _classify_speech_rate(
         raw_result["canonical"], raw_result["duration_sec"]
     )
+    # 디버그: 들어온 오디오에서 인식기가 무엇을 뽑았는지 한 줄로 흘려보낸다.
+    # silence / 잘못된 wav / 모델 추론 이슈를 즉시 진단할 수 있다.
+    logger.info(
+        "/analyze dur=%.2fs canonical_len=%d perceived_len=%d per=%s rate=%s",
+        raw_result.get("duration_sec", 0.0),
+        len(raw_result.get("canonical") or []),
+        len(raw_result.get("recognized") or []),
+        raw_result.get("per"),
+        speech_rate,
+    )
     return {
         "perceived": raw_result["recognized"],
         "canonical": raw_result["canonical"],
