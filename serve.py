@@ -64,8 +64,48 @@ except Exception:
 state: dict = {"scorer": None, "g2p": None, "config": {}}
 
 
+# 잡음/무음 제거 파라미터. 학습자가 "녹음 시작" 직후 망설이며 생기는 앞쪽 무음과
+# 발음 종료 후 종료 버튼까지의 뒤쪽 무음을 컷해 wav2vec2 인식률을 끌어올린다.
+# 너무 공격적이면 onset/offset 자음 (특히 무성 파열음 /p/ /t/ /k/) 이 잘리므로 가드 패딩을 둔다.
+_VAD_FRAME_MS = 25         # 프레임 길이
+_VAD_HOP_MS = 10           # 프레임 홉
+_VAD_DB_THRESH = -40.0     # peak 대비 -40dB 미만이면 무음으로 본다
+_VAD_ABS_FLOOR = 1e-3      # peak 자체가 너무 작으면 무음 트림 자체를 포기 (전구간 잡음일 가능성)
+_VAD_PAD_MS = 80           # 트림 후 양끝에 다시 붙여주는 가드 패딩
+
+
+def _trim_silence(wav: torch.Tensor, sr: int) -> torch.Tensor:
+    """앞뒤 무음을 RMS 기반 VAD 로 제거. 중간 무음은 보존한다 (발음 사이 자연스러운 호흡)."""
+    if wav.numel() == 0:
+        return wav
+    peak = wav.abs().max().item()
+    if peak < _VAD_ABS_FLOOR:
+        return wav  # 전체가 너무 작다 → 트림하지 않고 그대로 (모델이 판단)
+
+    frame_len = max(1, int(sr * _VAD_FRAME_MS / 1000))
+    hop_len = max(1, int(sr * _VAD_HOP_MS / 1000))
+    pad_len = int(sr * _VAD_PAD_MS / 1000)
+
+    # 프레임별 RMS 를 dBFS (peak 기준) 로 환산해 thresh 와 비교한다.
+    frames = wav.unfold(0, frame_len, hop_len)  # [num_frames, frame_len]
+    if frames.shape[0] == 0:
+        return wav
+    rms = frames.pow(2).mean(dim=1).clamp_min(1e-12).sqrt()
+    db = 20.0 * torch.log10(rms / peak)
+    voiced = db > _VAD_DB_THRESH
+
+    if not voiced.any():
+        return wav  # 모두 무음 판정 → 그대로 보낸다 (잘못된 트림보다 안전)
+
+    first = int(voiced.nonzero()[0].item())
+    last = int(voiced.nonzero()[-1].item())
+    start = max(0, first * hop_len - pad_len)
+    end = min(wav.shape[0], last * hop_len + frame_len + pad_len)
+    return wav[start:end]
+
+
 def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
-    """업로드 바이트를 1D float32 mono 텐서(target_sr)로 변환."""
+    """업로드 바이트를 1D float32 mono 텐서(target_sr)로 변환하고 앞뒤 무음을 트림한다."""
     try:
         data, sr = sf.read(io.BytesIO(raw), dtype="float32")
     except Exception as e:
@@ -78,6 +118,14 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
         wav = wav.mean(dim=1)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
+    before = wav.shape[0]
+    wav = _trim_silence(wav, target_sr)
+    after = wav.shape[0]
+    if before != after:
+        logger.info(
+            "VAD trim: %.2fs -> %.2fs (cut %.2fs)",
+            before / target_sr, after / target_sr, (before - after) / target_sr,
+        )
     return wav
 
 
