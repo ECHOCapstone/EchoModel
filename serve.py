@@ -78,6 +78,13 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
         wav = wav.mean(dim=1)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
+    # 디버그: 입력 wav 의 길이 / 채널 / sample rate / 진폭 (RMS) 을 한 줄로 흘려 silence / format 이슈를 즉시 판정.
+    rms = float(torch.sqrt(torch.mean(wav.float() ** 2))) if wav.numel() > 0 else 0.0
+    peak = float(wav.abs().max()) if wav.numel() > 0 else 0.0
+    logger.info(
+        "_decode_upload: sr_in=%s -> sr_out=%s samples=%d rms=%.5f peak=%.5f bytes=%d",
+        sr, target_sr, wav.numel(), rms, peak, len(raw),
+    )
     return wav
 
 
