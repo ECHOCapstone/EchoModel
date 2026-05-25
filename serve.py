@@ -64,7 +64,7 @@ except Exception:
 state: dict = {"scorer": None, "g2p": None, "config": {}}
 
 
-# 잡음/무음 제거 파라미터. 학습자가 "녹음 시작" 직후 망설이며 생기는 앞쪽 무음과
+# 잡음 / 무음 제거 파라미터. 학습자가 "녹음 시작" 직후 망설이며 생기는 앞쪽 무음과
 # 발음 종료 후 종료 버튼까지의 뒤쪽 무음을 컷해 wav2vec2 인식률을 끌어올린다.
 # 너무 공격적이면 onset/offset 자음 (특히 무성 파열음 /p/ /t/ /k/) 이 잘리므로 가드 패딩을 둔다.
 _VAD_FRAME_MS = 25         # 프레임 길이
@@ -72,6 +72,52 @@ _VAD_HOP_MS = 10           # 프레임 홉
 _VAD_DB_THRESH = -40.0     # peak 대비 -40dB 미만이면 무음으로 본다
 _VAD_ABS_FLOOR = 1e-3      # peak 자체가 너무 작으면 무음 트림 자체를 포기 (전구간 잡음일 가능성)
 _VAD_PAD_MS = 80           # 트림 후 양끝에 다시 붙여주는 가드 패딩
+
+# 배경 잡음 제거 파라미터. 보수적 — wav2vec2 가 학습한 도메인에서 너무 벗어나지 않게.
+# 1) HPF: 80Hz 미만 (에어컨 / 팬 / 험) 제거. 음성 fundamental 은 80Hz 이상.
+# 2) Spectral gating: 처음 _DENOISE_PROFILE_MS 를 잡음 프로파일로 잡아, 각 frequency bin 에서
+#    프로파일 평균 + k*std 이하는 _DENOISE_FLOOR 비율까지만 남긴다 (완전 제거하면 musical noise 발생).
+_DENOISE_HPF_HZ = 80.0
+_DENOISE_FRAME_MS = 32
+_DENOISE_HOP_MS = 8
+_DENOISE_PROFILE_MS = 200  # 처음 0.2초를 잡음 프로파일로 가정
+_DENOISE_K = 1.5           # noise floor 위로 k*std 까지는 잡음으로 본다
+_DENOISE_FLOOR = 0.1       # 잡음 bin 도 10% 는 남겨 artifact 줄이기
+
+
+def _denoise(wav: torch.Tensor, sr: int) -> torch.Tensor:
+    """저주파 험 제거 + STFT spectral gating 으로 정상 잡음을 약하게 줄인다.
+
+    프로파일링 가능한 분량 (>= _DENOISE_PROFILE_MS) 이 없거나, 신호가 너무 짧으면 HPF 만 적용한다.
+    """
+    if wav.numel() == 0:
+        return wav
+    # 1) Highpass: 험·팬 같은 60~80Hz 저주파 잡음 제거.
+    wav = torchaudio.functional.highpass_biquad(wav, sample_rate=sr, cutoff_freq=_DENOISE_HPF_HZ)
+
+    profile_samples = int(sr * _DENOISE_PROFILE_MS / 1000)
+    n_fft = max(256, int(sr * _DENOISE_FRAME_MS / 1000))
+    hop = max(64, int(sr * _DENOISE_HOP_MS / 1000))
+    if wav.shape[0] < profile_samples + n_fft * 2:
+        return wav  # 신호가 너무 짧으면 spectral gating 생략
+
+    window = torch.hann_window(n_fft, device=wav.device)
+    spec = torch.stft(wav, n_fft=n_fft, hop_length=hop, window=window, return_complex=True)
+    mag = spec.abs()
+    phase = spec / (mag + 1e-10)
+
+    # 프로파일 구간 (시작 _DENOISE_PROFILE_MS) 의 평균/표준편차를 freq bin 별로.
+    profile_frames = max(1, profile_samples // hop)
+    noise_mag = mag[:, :profile_frames]
+    noise_mean = noise_mag.mean(dim=1, keepdim=True)
+    noise_std = noise_mag.std(dim=1, keepdim=True)
+    threshold = noise_mean + _DENOISE_K * noise_std
+
+    # threshold 미만은 _DENOISE_FLOOR 비율로 감쇠, 그 이상은 그대로 둔다.
+    mask = torch.where(mag > threshold, torch.ones_like(mag), torch.full_like(mag, _DENOISE_FLOOR))
+    cleaned_spec = mag * mask * phase
+    cleaned = torch.istft(cleaned_spec, n_fft=n_fft, hop_length=hop, window=window, length=wav.shape[0])
+    return cleaned
 
 
 def _trim_silence(wav: torch.Tensor, sr: int) -> torch.Tensor:
@@ -118,6 +164,8 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
         wav = wav.mean(dim=1)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
+    # 잡음 → 무음 트림 순서. 잡음을 먼저 줄여야 VAD 가 발화 구간을 더 정확히 잡는다.
+    wav = _denoise(wav, target_sr)
     before = wav.shape[0]
     wav = _trim_silence(wav, target_sr)
     after = wav.shape[0]
