@@ -78,13 +78,6 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
         wav = wav.mean(dim=1)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
-    # 디버그: 입력 wav 의 길이 / 채널 / sample rate / 진폭 (RMS) 을 한 줄로 흘려 silence / format 이슈를 즉시 판정.
-    rms = float(torch.sqrt(torch.mean(wav.float() ** 2))) if wav.numel() > 0 else 0.0
-    peak = float(wav.abs().max()) if wav.numel() > 0 else 0.0
-    logger.info(
-        "_decode_upload: sr_in=%s -> sr_out=%s samples=%d rms=%.5f peak=%.5f bytes=%d",
-        sr, target_sr, wav.numel(), rms, peak, len(raw),
-    )
     return wav
 
 
@@ -216,16 +209,6 @@ async def analyze(
     raw_result = _score_upload(raw, canonical, keep_silence, audio.filename)
     speech_rate, speech_rate_ratio = _classify_speech_rate(
         raw_result["canonical"], raw_result["duration_sec"]
-    )
-    # 디버그: 들어온 오디오에서 인식기가 무엇을 뽑았는지 한 줄로 흘려보낸다.
-    # silence / 잘못된 wav / 모델 추론 이슈를 즉시 진단할 수 있다.
-    logger.info(
-        "/analyze dur=%.2fs canonical_len=%d perceived_len=%d per=%s rate=%s",
-        raw_result.get("duration_sec", 0.0),
-        len(raw_result.get("canonical") or []),
-        len(raw_result.get("recognized") or []),
-        raw_result.get("per"),
-        speech_rate,
     )
     return {
         "perceived": raw_result["recognized"],
