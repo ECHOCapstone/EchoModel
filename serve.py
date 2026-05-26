@@ -20,9 +20,11 @@ Endpoints:
 from __future__ import annotations
 
 import argparse
+import datetime
 import io
 import logging
 import os
+import pathlib
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -62,6 +64,29 @@ except Exception:
 
 # lifespan 동안 유지되는 추론기/G2P 핸들과 부팅 설정.
 state: dict = {"scorer": None, "g2p": None, "config": {}}
+
+
+# 디버그용 dump 디렉토리. 환경변수 ECHO_DUMP_DIR 가 설정되어 있을 때만 활성화.
+# 활성화되면 매 요청마다 raw upload 와 denoise+VAD 적용 후 신호를 함께 떨어뜨려 비교 청취 가능.
+_DUMP_DIR = os.environ.get("ECHO_DUMP_DIR")
+
+
+def _dump_audio(raw: bytes, processed: torch.Tensor, sr: int, filename: Optional[str]) -> None:
+    """원본 업로드 바이트와 전처리 후 텐서를 디스크에 함께 저장한다 (ECHO_DUMP_DIR 설정 시만)."""
+    if not _DUMP_DIR:
+        return
+    try:
+        out_dir = pathlib.Path(_DUMP_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stem = (filename or "rec").rsplit(".", 1)[0].replace("/", "_").replace("\\", "_")
+        raw_path = out_dir / f"{ts}_{stem}_raw.wav"
+        proc_path = out_dir / f"{ts}_{stem}_processed.wav"
+        raw_path.write_bytes(raw)
+        sf.write(str(proc_path), processed.cpu().numpy(), sr)
+        logger.info("Dumped audio: %s, %s", raw_path.name, proc_path.name)
+    except Exception as e:
+        logger.warning("Audio dump failed (ignored): %s", e)
 
 
 # 잡음 / 무음 제거 파라미터. 학습자가 "녹음 시작" 직후 망설이며 생기는 앞쪽 무음과
@@ -256,6 +281,7 @@ def _score_upload(
     waveform = _decode_upload(raw, scorer.sampling_rate)
     if waveform.numel() == 0:
         raise HTTPException(400, "Decoded audio is empty")
+    _dump_audio(raw, waveform, scorer.sampling_rate, filename)
 
     result = scorer.score(waveform, canonical=canonical, keep_silence=keep_silence)
     result["filename"] = filename
