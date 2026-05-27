@@ -224,10 +224,10 @@ async def lifespan(app: FastAPI):
         "Scorer ready on %s (tts_available=%s, g2p_ready=True)",
         state["scorer"].device, _TTS_AVAILABLE,
     )
-    # slplab 비교 모델 (선택 로드). ECHO_SLPLAB_MODEL=none 이면 건너뛴다.
-    slplab_model_id = os.environ.get("ECHO_SLPLAB_MODEL", DEFAULT_SLPLAB_MODEL)
+    # slplab 비교 모델 (선택 로드). --slplab-model none 이면 건너뛴다.
+    slplab_model_id = cfg.get("slplab_model", "")
+    slplab_device = cfg.get("slplab_device", cfg["device"])
     if slplab_model_id and slplab_model_id.lower() != "none":
-        slplab_device = os.environ.get("ECHO_SLPLAB_DEVICE", cfg["device"])
         logger.info("Loading slplab model: %s on %s", slplab_model_id, slplab_device)
         state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(slplab_model_id)
         state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(slplab_model_id).to(slplab_device).eval()
@@ -475,6 +475,10 @@ def parse_args():
     p.add_argument("--checkpoint", default=os.environ.get("ECHO_CHECKPOINT", DEFAULT_CHECKPOINT))
     p.add_argument("--phoneme-map", default=os.environ.get("ECHO_PHONEME_MAP", DEFAULT_PHONEME_MAP))
     p.add_argument("--device", default=os.environ.get("ECHO_DEVICE", "cuda"))
+    p.add_argument("--slplab-model", default=os.environ.get("ECHO_SLPLAB_MODEL", DEFAULT_SLPLAB_MODEL),
+                    help="HuggingFace model ID for slplab comparison. 'none' to skip.")
+    p.add_argument("--slplab-device", default=os.environ.get("ECHO_SLPLAB_DEVICE"),
+                    help="Device for slplab model. Defaults to --device value.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--reload", action="store_true")
@@ -488,6 +492,8 @@ def main():
         "checkpoint": args.checkpoint,
         "phoneme_map": args.phoneme_map,
         "device": args.device,
+        "slplab_model": args.slplab_model,
+        "slplab_device": args.slplab_device or args.device,
     }
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
