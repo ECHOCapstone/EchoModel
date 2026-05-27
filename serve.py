@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+from echo.evaluation.metrics import get_alignment_with_indices
 from echo.inference import PronunciationScorer
 from echo.utils.g2p import G2P
 
@@ -337,14 +338,82 @@ def _classify_speech_rate(canonical_phonemes: list, duration_sec: float) -> tupl
     return ("normal", round(ratio, 2))
 
 
+def _build_alignment(canonical_list: list[str], perceived_list: list[str]) -> dict:
+    """Levenshtein 정렬로 기존 PronunciationScorer.diagnose 와 동일한 alignment/errors 구조를 만든다."""
+    op_label = {"=": "correct", "S": "substitution", "D": "deletion", "I": "insertion"}
+    align = get_alignment_with_indices(canonical_list, perceived_list)
+    alignment, errors = [], []
+    for op, ref_idx, hyp_idx in align:
+        item = {
+            "op": op_label[op],
+            "canonical_index": ref_idx,
+            "canonical": canonical_list[ref_idx] if ref_idx is not None else None,
+            "recognized_index": hyp_idx,
+            "recognized": perceived_list[hyp_idx] if hyp_idx is not None else None,
+        }
+        alignment.append(item)
+        if op != "=":
+            errors.append(item)
+    num_errors = sum(1 for op, _, _ in align if op != "=")
+    per = round(num_errors / len(canonical_list), 4) if canonical_list else 0.0
+    return {"alignment": alignment, "errors": errors, "per": per}
+
+
+def _analyze_with_slplab(raw: bytes, canonical: Optional[str], filename: Optional[str]) -> dict:
+    """slplab 모델로 인식 후 기존 /analyze 와 동일한 응답 형식을 만든다."""
+    scorer = state["scorer"]
+    sr = scorer.sampling_rate if scorer else 16000
+    if not raw:
+        raise HTTPException(400, "Empty audio upload")
+    waveform = _decode_upload(raw, sr)
+    if waveform.numel() == 0:
+        raise HTTPException(400, "Decoded audio is empty")
+    _dump_audio(raw, waveform, sr, filename)
+
+    perceived_raw = _slplab_recognize(waveform)
+    perceived = [p.replace("_err", "") for p in perceived_raw]
+
+    canonical_list: list[str] = []
+    if canonical and canonical.strip():
+        canonical_list = canonical.strip().split()
+
+    diag = _build_alignment(canonical_list, perceived) if canonical_list else {
+        "alignment": [], "errors": [], "per": 0.0,
+    }
+    duration_sec = float(waveform.shape[0] / sr)
+    speech_rate, speech_rate_ratio = _classify_speech_rate(canonical_list, duration_sec)
+
+    return {
+        "perceived": perceived,
+        "canonical": canonical_list,
+        "peak_softmax": [],
+        "alignment": diag["alignment"],
+        "errors": diag["errors"],
+        "per": diag["per"],
+        "duration_sec": duration_sec,
+        "speech_rate": speech_rate,
+        "speech_rate_ratio": speech_rate_ratio,
+    }
+
+
 @app.post("/analyze")
 async def analyze(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
+    model: str = Form("echo"),
 ):
-    """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과 + 발화 속도 분류."""
+    """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과 + 발화 속도 분류.
+
+    model 파라미터로 인식기를 선택한다.
+      - echo  (기본): 기존 ECHO fine-tune 체크포인트
+      - slplab: slplab/wav2vec2-large-robust-L2-english-phoneme-recognition (한국인 L2 영어)
+    """
     raw = await audio.read()
+
+    if model == "slplab":
+        return _analyze_with_slplab(raw, canonical, audio.filename)
+
     raw_result = _score_upload(raw, canonical, keep_silence, audio.filename)
     speech_rate, speech_rate_ratio = _classify_speech_rate(
         raw_result["canonical"], raw_result["duration_sec"]
