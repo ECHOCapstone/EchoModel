@@ -1,7 +1,7 @@
 """ECHO 모델 서버 - 발음 평가(/analyze) + G2P(/g2p) + TTS(/tts).
 
 Run:
-    python serve.py \
+    ECHO_DUMP_DIR=/home/syh/workspace/ECHO_model/_dumps serve.py \
         --checkpoint experiments/wav2vec2-base/film/20260506_004510/checkpoints/best_mdd_f1.pth \
         --phoneme-map data/phoneme_to_id.json \
         --host 0.0.0.0 --port 8001
@@ -36,6 +36,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
 from echo.inference import PronunciationScorer
 from echo.utils.g2p import G2P
 
@@ -45,6 +47,10 @@ logger = logging.getLogger("echo.serve")
 DEFAULT_CHECKPOINT = "experiments/wav2vec2-base/baseline/20260411_030102/checkpoints/best_mdd_f1.pth"
 DEFAULT_PHONEME_MAP = "data/phoneme_to_id.json"
 DEFAULT_PORT = 8001
+
+# slplab 비교 모델 (한국인 L2 영어 발음으로 fine-tune 된 wav2vec2-large-robust).
+# 환경변수로 모델 ID / 디바이스 지정 가능. 로드하지 않으려면 ECHO_SLPLAB_MODEL=none 으로 설정.
+DEFAULT_SLPLAB_MODEL = "slplab/wav2vec2-large-robust-L2-english-phoneme-recognition"
 
 # 프론트엔드 및 mock 백엔드의 개발 origin.
 ALLOWED_ORIGINS = [
@@ -63,7 +69,7 @@ except Exception:
     _TTS_AVAILABLE = False
 
 # lifespan 동안 유지되는 추론기/G2P 핸들과 부팅 설정.
-state: dict = {"scorer": None, "g2p": None, "config": {}}
+state: dict = {"scorer": None, "g2p": None, "slplab_model": None, "slplab_processor": None, "config": {}}
 
 
 # 디버그용 dump 디렉토리. 환경변수 ECHO_DUMP_DIR 가 설정되어 있을 때만 활성화.
@@ -218,9 +224,19 @@ async def lifespan(app: FastAPI):
         "Scorer ready on %s (tts_available=%s, g2p_ready=True)",
         state["scorer"].device, _TTS_AVAILABLE,
     )
+    # slplab 비교 모델 (선택 로드). ECHO_SLPLAB_MODEL=none 이면 건너뛴다.
+    slplab_model_id = os.environ.get("ECHO_SLPLAB_MODEL", DEFAULT_SLPLAB_MODEL)
+    if slplab_model_id and slplab_model_id.lower() != "none":
+        slplab_device = os.environ.get("ECHO_SLPLAB_DEVICE", cfg["device"])
+        logger.info("Loading slplab model: %s on %s", slplab_model_id, slplab_device)
+        state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(slplab_model_id)
+        state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(slplab_model_id).to(slplab_device).eval()
+        logger.info("slplab model ready (%d params)", sum(p.numel() for p in state["slplab_model"].parameters()))
     yield
     state["scorer"] = None
     state["g2p"] = None
+    state["slplab_model"] = None
+    state["slplab_processor"] = None
 
 
 app = FastAPI(title="ECHO Pronunciation Server", lifespan=lifespan)
@@ -255,6 +271,7 @@ def healthz():
         "num_phonemes": len(scorer.phoneme_to_id) if scorer else None,
         "tts_available": _TTS_AVAILABLE,
         "g2p_ready": state["g2p"] is not None,
+        "slplab_ready": state["slplab_model"] is not None,
     }
 
 
@@ -342,6 +359,77 @@ async def analyze(
         "duration_sec": raw_result["duration_sec"],
         "speech_rate": speech_rate,
         "speech_rate_ratio": speech_rate_ratio,
+    }
+
+
+def _slplab_recognize(waveform: torch.Tensor) -> list[str]:
+    """slplab 모델로 음소 시퀀스 인식. _err 태그 포함 그대로 반환한다."""
+    model = state["slplab_model"]
+    proc = state["slplab_processor"]
+    if model is None or proc is None:
+        raise HTTPException(503, "slplab model not loaded")
+    device = next(model.parameters()).device
+    inputs = proc(waveform.cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+    input_values = inputs.input_values.to(device)
+    with torch.no_grad():
+        logits = model(input_values).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
+    raw_text = proc.batch_decode(predicted_ids)[0]
+    return raw_text.strip().split() if raw_text.strip() else []
+
+
+def _simple_per(perceived: list[str], canonical: list[str]) -> float:
+    """Levenshtein 기반 PER. 두 시퀀스를 비교해 음소 오류율을 반환한다."""
+    if not canonical:
+        return 0.0 if not perceived else 1.0
+    n, m = len(perceived), len(canonical)
+    dp = list(range(m + 1))
+    for i in range(1, n + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, m + 1):
+            cost = 0 if perceived[i - 1] == canonical[j - 1] else 1
+            dp[j], prev = min(dp[j] + 1, dp[j - 1] + 1, prev + cost), dp[j]
+    return round(dp[m] / m, 4)
+
+
+@app.post("/analyze-slplab")
+async def analyze_slplab(
+    audio: UploadFile = File(...),
+    canonical: Optional[str] = Form(None),
+):
+    """slplab (한국인 L2 영어 fine-tune) 모델로 음소 인식. 기존 ECHO 모델과 비교 테스트용.
+
+    응답의 perceived 에 _err 접미사가 붙은 음소는 모델이 오류로 판정한 발음이다.
+    perceived_clean 은 _err 제거 후 순수 음소 시퀀스, per 은 perceived_clean 과 canonical 비교.
+    """
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(400, "Empty audio upload")
+    scorer = state["scorer"]
+    sr = scorer.sampling_rate if scorer else 16000
+    waveform = _decode_upload(raw, sr)
+    if waveform.numel() == 0:
+        raise HTTPException(400, "Decoded audio is empty")
+    _dump_audio(raw, waveform, sr, audio.filename)
+
+    perceived = _slplab_recognize(waveform)
+    perceived_clean = [p.replace("_err", "") for p in perceived]
+    error_indices = [i for i, p in enumerate(perceived) if "_err" in p]
+
+    canonical_list: list[str] = []
+    if canonical and canonical.strip():
+        canonical_list = canonical.strip().split()
+
+    per = _simple_per(perceived_clean, canonical_list) if canonical_list else None
+
+    return {
+        "model": "slplab/wav2vec2-large-robust-L2-english-phoneme-recognition",
+        "perceived": perceived,
+        "perceived_clean": perceived_clean,
+        "error_indices": error_indices,
+        "canonical": canonical_list,
+        "per": per,
+        "duration_sec": float(waveform.shape[0] / sr),
     }
 
 
