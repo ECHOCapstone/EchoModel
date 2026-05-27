@@ -7,6 +7,13 @@ Run:
         --host 0.0.0.0 --port 8001
         -- device cuda
 
+python serve.py \
+  --checkpoint none \
+  --slplab-model slplab/wav2vec2-large-robust-L2-english-phoneme-recognition \
+  --device cuda \
+  --host 0.0.0.0 --port 8001
+
+        
 Endpoints:
     GET  /healthz   서버/모델/TTS/G2P 가용 상태
     GET  /phonemes  학습된 음소 리스트
@@ -224,13 +231,19 @@ async def lifespan(app: FastAPI):
             phoneme_map_path=cfg["phoneme_map"],
             device=cfg["device"],
         )
-        state["g2p"] = G2P.from_phoneme_map(cfg["phoneme_map"])
         logger.info(
-            "ECHO scorer ready on %s (tts_available=%s, g2p_ready=True)",
+            "ECHO scorer ready on %s (tts_available=%s)",
             state["scorer"].device, _TTS_AVAILABLE,
         )
     else:
         logger.info("ECHO scorer skipped (--checkpoint none)")
+
+    # G2P 는 ECHO 모델 없이도 독립 동작 가능 — phoneme_map 만 있으면 로드한다.
+    # 백엔드가 /g2p 로 canonical 시퀀스를 만들어 /analyze 에 보내므로 항상 필요하다.
+    pmap = cfg.get("phoneme_map", "")
+    if pmap and pmap.lower() != "none" and os.path.isfile(pmap):
+        state["g2p"] = G2P.from_phoneme_map(pmap)
+        logger.info("G2P ready (phoneme_map=%s)", pmap)
 
     # slplab 모델 (선택 로드). --slplab-model none 이면 건너뛴다.
     slplab_model_id = cfg.get("slplab_model", "")
