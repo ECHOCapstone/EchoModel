@@ -76,3 +76,6 @@ checkpoints/
 .ruff_cache/
 huggingface/
 .hf_cache/
+
+# 로컬 디버그용 wav dump (ECHO_DUMP_DIR 타깃)
+_dumps/

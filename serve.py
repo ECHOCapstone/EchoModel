@@ -9,6 +9,7 @@ Run:
 
 python serve.py \
   --checkpoint none \
+  --phoneme-map data/phoneme_to_id.json \
   --slplab-model slplab/wav2vec2-large-robust-L2-english-phoneme-recognition \
   --device cuda \
   --host 0.0.0.0 --port 8001
