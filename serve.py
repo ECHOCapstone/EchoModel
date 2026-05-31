@@ -15,10 +15,15 @@ python serve.py \
   --host 0.0.0.0 --port 8001
 
         
+모델 선택:
+    data/models.json (--models-config) 에 후보 모델을 두고, /analyze 의 model 폼 필드로 고른다.
+    요청 시 교체 로드되므로 한 번에 하나만 메모리에 올라간다. 후보는 GET /models 로 조회.
+
 Endpoints:
-    GET  /healthz   서버/모델/TTS/G2P 가용 상태
+    GET  /healthz   서버/모델/TTS/G2P 가용 상태 (active_model 포함)
+    GET  /models    선택 가능한 음소인식 모델 후보 + 활성 모델
     GET  /phonemes  학습된 음소 리스트
-    POST /analyze   발음 평가 - perceived/canonical/peak_softmax/alignment/errors/per
+    POST /analyze   발음 평가 - perceived/canonical/peak_softmax/alignment/errors/per (model 폼 필드로 모델 선택)
     POST /score     기존 호환 - recognized 키 사용
     POST /g2p       텍스트 → ARPAbet 음소 시퀀스 (CMUDict + OOV 신경망 폴백)
     POST /tts       텍스트 → mp3 음성 (gTTS)
@@ -30,6 +35,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import io
+import json
 import logging
 import os
 import pathlib
@@ -63,6 +69,10 @@ DEFAULT_PORT = 8001
 # 환경변수로 모델 ID / 디바이스 지정 가능. 로드하지 않으려면 ECHO_SLPLAB_MODEL=none 으로 설정.
 DEFAULT_SLPLAB_MODEL = "slplab/wav2vec2-large-robust-L2-english-phoneme-recognition"
 
+# 음소인식 모델 레지스트리 파일. 어드민에서 고를 수 있는 모델 후보 목록의 단일 출처.
+# 없으면 CLI 인자(--checkpoint / --slplab-model)로 1~2개를 합성한다.
+DEFAULT_MODELS_CONFIG = "data/models.json"
+
 # 프론트엔드 및 mock 백엔드의 개발 origin.
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -80,7 +90,94 @@ except Exception:
     _TTS_AVAILABLE = False
 
 # lifespan 동안 유지되는 추론기/G2P 핸들과 부팅 설정.
-state: dict = {"scorer": None, "g2p": None, "slplab_model": None, "slplab_processor": None, "config": {}}
+# registry: {"models": [entry...], "default": id}, active_model_id: 현재 메모리에 올라온 모델 id.
+state: dict = {
+    "scorer": None,
+    "g2p": None,
+    "slplab_model": None,
+    "slplab_processor": None,
+    "config": {},
+    "registry": {"models": [], "default": None},
+    "active_model_id": None,
+}
+
+
+def _load_registry(cfg: dict) -> dict:
+    """models.json 이 있으면 그걸로 모델 레지스트리를 만들고, 없으면 CLI 인자로 합성한다.
+    반환: {"models": [entry...], "default": id}. entry = {id,label,type, checkpoint?,phoneme_map?,hf_id?}."""
+    path = cfg.get("models_config", "")
+    if path and os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        models = [m for m in data.get("models", []) if isinstance(m, dict) and m.get("id")]
+        default = data.get("default") or (models[0]["id"] if models else None)
+        logger.info("Loaded model registry from %s (%d models, default=%s)", path, len(models), default)
+        return {"models": models, "default": default}
+
+    # 폴백: CLI 인자로 합성. checkpoint(ECHO) / slplab-model(slplab) 각각 한 개씩.
+    models = []
+    ckpt = cfg.get("checkpoint", "")
+    if ckpt and ckpt.lower() != "none":
+        models.append({"id": "echo", "label": "ECHO", "type": "echo",
+                       "checkpoint": ckpt, "phoneme_map": cfg.get("phoneme_map", DEFAULT_PHONEME_MAP)})
+    slp = cfg.get("slplab_model", "")
+    if slp and slp.lower() != "none":
+        models.append({"id": "slplab", "label": "slplab", "type": "slplab", "hf_id": slp})
+    default = models[0]["id"] if models else None
+    return {"models": models, "default": default}
+
+
+def _entry_by_id(model_id: Optional[str]) -> Optional[dict]:
+    if not model_id:
+        return None
+    for m in state["registry"].get("models", []):
+        if m.get("id") == model_id:
+            return m
+    return None
+
+
+def _unload_current() -> None:
+    """현재 로드된 인식 모델을 내려 GPU/RAM 을 회수한다 (G2P 는 모델과 무관하므로 유지)."""
+    state["scorer"] = None
+    state["slplab_model"] = None
+    state["slplab_processor"] = None
+    state["active_model_id"] = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _load_model(entry: dict) -> None:
+    """레지스트리 entry 의 type 에 따라 인식 모델을 메모리에 올린다."""
+    cfg = state["config"]
+    mtype = entry.get("type")
+    if mtype == "echo":
+        state["scorer"] = PronunciationScorer.from_checkpoint(
+            checkpoint_path=entry["checkpoint"],
+            phoneme_map_path=entry.get("phoneme_map", cfg.get("phoneme_map", DEFAULT_PHONEME_MAP)),
+            device=cfg["device"],
+        )
+    elif mtype == "slplab":
+        device = cfg.get("slplab_device", cfg["device"])
+        state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(entry["hf_id"])
+        state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(entry["hf_id"]).to(device).eval()
+    else:
+        raise HTTPException(400, f"unknown model type: {mtype}")
+    state["active_model_id"] = entry["id"]
+    logger.info("Recognition model ready: %s (type=%s)", entry["id"], mtype)
+
+
+def ensure_loaded(model_id: Optional[str]) -> dict:
+    """요청한 모델을 보장 로드한다. 이미 활성이면 그대로, 다르면 기존 것을 내리고 교체 로드한다.
+    model_id 가 None 이면 활성 모델, 그것도 없으면 레지스트리 기본 모델을 쓴다. 활성 entry 를 반환."""
+    target_id = model_id or state["active_model_id"] or state["registry"].get("default")
+    entry = _entry_by_id(target_id)
+    if entry is None:
+        raise HTTPException(400, f"unknown model: {target_id}")
+    if state["active_model_id"] != entry["id"]:
+        logger.info("Switching recognition model: %s -> %s", state["active_model_id"], entry["id"])
+        _unload_current()
+        _load_model(entry)
+    return entry
 
 
 # 디버그용 dump 디렉토리. 환경변수 ECHO_DUMP_DIR 가 설정되어 있을 때만 활성화.
@@ -223,48 +320,24 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
 async def lifespan(app: FastAPI):
     cfg = state["config"]
 
-    # ECHO 모델 (선택 로드). --checkpoint none 이면 건너뛴다.
-    ckpt = cfg.get("checkpoint", "")
-    if ckpt and ckpt.lower() != "none":
-        logger.info("Loading ECHO scorer from %s", ckpt)
-        state["scorer"] = PronunciationScorer.from_checkpoint(
-            checkpoint_path=ckpt,
-            phoneme_map_path=cfg["phoneme_map"],
-            device=cfg["device"],
-        )
-        logger.info(
-            "ECHO scorer ready on %s (tts_available=%s)",
-            state["scorer"].device, _TTS_AVAILABLE,
-        )
-    else:
-        logger.info("ECHO scorer skipped (--checkpoint none)")
-
-    # G2P 는 ECHO 모델 없이도 독립 동작 가능 — phoneme_map 만 있으면 로드한다.
+    # G2P 는 인식 모델과 무관하게 독립 동작 — phoneme_map 만 있으면 로드한다.
     # 백엔드가 /g2p 로 canonical 시퀀스를 만들어 /analyze 에 보내므로 항상 필요하다.
     pmap = cfg.get("phoneme_map", "")
     if pmap and pmap.lower() != "none" and os.path.isfile(pmap):
         state["g2p"] = G2P.from_phoneme_map(pmap)
         logger.info("G2P ready (phoneme_map=%s)", pmap)
 
-    # slplab 모델 (선택 로드). --slplab-model none 이면 건너뛴다.
-    slplab_model_id = cfg.get("slplab_model", "")
-    slplab_device = cfg.get("slplab_device", cfg["device"])
-    if slplab_model_id and slplab_model_id.lower() != "none":
-        logger.info("Loading slplab model: %s on %s", slplab_model_id, slplab_device)
-        state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(slplab_model_id)
-        state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(slplab_model_id).to(slplab_device).eval()
-        logger.info("slplab model ready (%d params)", sum(p.numel() for p in state["slplab_model"].parameters()))
+    # 모델 레지스트리를 읽고 기본 모델을 메모리에 올린다. 이후 /analyze?model=<id> 로 교체된다.
+    state["registry"] = _load_registry(cfg)
+    default_id = state["registry"].get("default")
+    if default_id:
+        ensure_loaded(default_id)
     else:
-        logger.info("slplab model skipped (--slplab-model none)")
-
-    if state["scorer"] is None and state["slplab_model"] is None:
-        logger.warning("No recognition model loaded — /analyze will return 503")
+        logger.warning("No recognition model in registry — /analyze will return 503")
 
     yield
-    state["scorer"] = None
+    _unload_current()
     state["g2p"] = None
-    state["slplab_model"] = None
-    state["slplab_processor"] = None
 
 
 app = FastAPI(title="ECHO Pronunciation Server", lifespan=lifespan)
@@ -294,12 +367,26 @@ def index():
 def healthz():
     scorer = state["scorer"]
     return {
-        "ok": scorer is not None,
+        "ok": scorer is not None or state["slplab_model"] is not None,
+        "active_model": state["active_model_id"],
         "device": str(scorer.device) if scorer else None,
         "num_phonemes": len(scorer.phoneme_to_id) if scorer else None,
         "tts_available": _TTS_AVAILABLE,
         "g2p_ready": state["g2p"] is not None,
         "slplab_ready": state["slplab_model"] is not None,
+    }
+
+
+@app.get("/models")
+def models():
+    """선택 가능한 음소인식 모델 후보 + 현재 활성 모델. 백엔드/어드민이 드롭다운을 그릴 때 쓴다."""
+    reg = state["registry"]
+    return {
+        "active": state["active_model_id"],
+        "models": [
+            {"id": m["id"], "label": m.get("label", m["id"]), "type": m.get("type")}
+            for m in reg.get("models", [])
+        ],
     }
 
 
@@ -428,16 +515,17 @@ async def analyze(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
+    model: Optional[str] = Form(None),
 ):
     """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과 + 발화 속도 분류.
 
-    서버 구동 시 로드된 모델을 자동 사용한다.
-      - --checkpoint 로 ECHO 모델이 로드됐으면 ECHO 사용
-      - --slplab-model 로 slplab 모델이 로드됐으면 slplab 사용
+    model 폼 필드로 레지스트리의 모델 id 를 지정하면 그 모델로 (필요 시 교체 로드 후) 인식한다.
+    생략하면 현재 활성 모델(없으면 레지스트리 기본 모델) 을 쓴다.
     """
     raw = await audio.read()
+    entry = ensure_loaded(model)
 
-    if state["slplab_model"] is not None:
+    if entry.get("type") == "slplab":
         return _analyze_with_slplab(raw, canonical, audio.filename)
 
     raw_result = _score_upload(raw, canonical, keep_silence, audio.filename)
@@ -519,6 +607,8 @@ def parse_args():
                     help="HuggingFace model ID for slplab comparison. 'none' to skip.")
     p.add_argument("--slplab-device", default=os.environ.get("ECHO_SLPLAB_DEVICE"),
                     help="Device for slplab model. Defaults to --device value.")
+    p.add_argument("--models-config", default=os.environ.get("ECHO_MODELS_CONFIG", DEFAULT_MODELS_CONFIG),
+                    help="음소인식 모델 레지스트리 JSON. 없으면 --checkpoint / --slplab-model 로 합성한다.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--reload", action="store_true")
@@ -534,6 +624,7 @@ def main():
         "device": args.device,
         "slplab_model": args.slplab_model,
         "slplab_device": args.slplab_device or args.device,
+        "models_config": args.models_config,
     }
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
