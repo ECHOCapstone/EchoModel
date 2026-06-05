@@ -1,20 +1,14 @@
 """ECHO 모델 서버 - 발음 평가(/analyze) + G2P(/g2p) + TTS(/tts).
 
 Run:
-    ECHO_DUMP_DIR=/home/syh/workspace/ECHO_model/_dumps serve.py \
-        --checkpoint experiments/wav2vec2-base/film/20260506_004510/checkpoints/best_mdd_f1.pth \
-        --phoneme-map data/phoneme_to_id.json \
-        --host 0.0.0.0 --port 8001
-        -- device cuda
+    # 모델 후보는 data/models.json 레지스트리에서 로드된다. 외부 노출은 ECHO_HOST=0.0.0.0 으로.
+    python serve.py --models-config data/models.json --device cuda --port 8001
 
-python serve.py \
-  --checkpoint none \
-  --phoneme-map data/phoneme_to_id.json \
-  --slplab-model slplab/wav2vec2-large-robust-L2-english-phoneme-recognition \
-  --device cuda \
-  --host 0.0.0.0 --port 8001
+    # 레지스트리 없이 슬랩 모델만 띄우는 예:
+    python serve.py \
+      --slplab-model slplab/wav2vec2-large-robust-L2-english-phoneme-recognition \
+      --device cuda --port 8001
 
-        
 모델 선택:
     data/models.json (--models-config) 에 후보 모델을 두고, /analyze 의 model 폼 필드로 고른다.
     요청 시 교체 로드되므로 한 번에 하나만 메모리에 올라간다. 후보는 GET /models 로 조회.
@@ -46,6 +40,7 @@ import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,16 +49,21 @@ from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from echo.evaluation.metrics import get_alignment_with_indices
 from echo.inference import PronunciationScorer
+from echo.utils.audio import WAV2VEC2_SAMPLE_RATE
 from echo.utils.g2p import G2P
 
 logger = logging.getLogger("echo.serve")
 
 # 추론 자원의 디폴트 위치 및 서버 포트.
-# checkpoint / phoneme-map 을 지정하지 않으면 (none) ECHO 모델을 로드하지 않는다.
-# slplab 모델만으로도 서버가 정상 동작하므로, 둘 중 최소 하나만 지정하면 된다.
-DEFAULT_CHECKPOINT = "experiments/wav2vec2-base/baseline/20260411_030102/checkpoints/best_mdd_f1.pth"
+# 모델 후보의 단일 출처는 data/models.json 레지스트리다. checkpoint 를 따로 지정하지 않으면("none")
+# 레지스트리에서 모델을 로드하며, slplab 모델만으로도 서버가 동작한다. 머신 종속 절대경로를 기본값으로
+# 박아두면 모델 재학습 시 즉시 깨지므로 기본값은 "none" 으로 둔다.
+DEFAULT_CHECKPOINT = "none"
 DEFAULT_PHONEME_MAP = "data/phoneme_to_id.json"
 DEFAULT_PORT = 8001
+
+# 업로드 오디오 최대 크기(바이트). 무제한 read 로 인한 메모리 고갈을 막는다. 환경변수로 조정 가능.
+MAX_UPLOAD_BYTES = int(os.environ.get("ECHO_MAX_UPLOAD_BYTES", str(16 * 1024 * 1024)))
 
 # slplab 비교 모델 (한국인 L2 영어 발음으로 fine-tune 된 wav2vec2-large-robust).
 # 환경변수로 모델 ID / 디바이스 지정 가능. 로드하지 않으려면 ECHO_SLPLAB_MODEL=none 으로 설정.
@@ -73,12 +73,11 @@ DEFAULT_SLPLAB_MODEL = "slplab/wav2vec2-large-robust-L2-english-phoneme-recognit
 # 없으면 CLI 인자(--checkpoint / --slplab-model)로 1~2개를 합성한다.
 DEFAULT_MODELS_CONFIG = "data/models.json"
 
-# 프론트엔드 및 mock 백엔드의 개발 origin.
+# CORS 허용 origin. 기본값은 프론트엔드/mock 백엔드의 개발 origin 이며, 운영에서는
+# ECHO_ALLOWED_ORIGINS(쉼표 구분)로 덮어쓴다.
+_DEFAULT_ORIGINS = "http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:8080"
 ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:8080",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:8080",
+    o.strip() for o in os.environ.get("ECHO_ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()
 ]
 
 # gTTS는 선택 의존성. 미설치 환경에서도 추론 엔드포인트는 정상 동작한다.
@@ -421,6 +420,14 @@ def _score_upload(
     return result
 
 
+# 업로드를 최대 크기까지만 읽어 메모리 고갈을 막는다. 한도를 넘으면 413 으로 거절한다.
+async def _read_limited(audio: UploadFile) -> bytes:
+    data = await audio.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Audio upload exceeds {MAX_UPLOAD_BYTES} bytes")
+    return data
+
+
 @app.post("/score")
 async def score(
     audio: UploadFile = File(...),
@@ -428,8 +435,9 @@ async def score(
     keep_silence: bool = Form(False),
 ):
     """기존 호환 응답: recognized 키 + peak_softmax 포함."""
-    raw = await audio.read()
-    return _score_upload(raw, canonical, keep_silence, audio.filename)
+    raw = await _read_limited(audio)
+    # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
+    return await run_in_threadpool(_score_upload, raw, canonical, keep_silence, audio.filename)
 
 
 # 영어 평균 발화 속도 (음소/초). 사용자 데이터에서 fine-tune 가능.
@@ -476,7 +484,7 @@ def _build_alignment(canonical_list: list[str], perceived_list: list[str]) -> di
 def _analyze_with_slplab(raw: bytes, canonical: Optional[str], filename: Optional[str]) -> dict:
     """slplab 모델로 인식 후 기존 /analyze 와 동일한 응답 형식을 만든다."""
     scorer = state["scorer"]
-    sr = scorer.sampling_rate if scorer else 16000
+    sr = scorer.sampling_rate if scorer else WAV2VEC2_SAMPLE_RATE
     if not raw:
         raise HTTPException(400, "Empty audio upload")
     waveform = _decode_upload(raw, sr)
@@ -522,13 +530,14 @@ async def analyze(
     model 폼 필드로 레지스트리의 모델 id 를 지정하면 그 모델로 (필요 시 교체 로드 후) 인식한다.
     생략하면 현재 활성 모델(없으면 레지스트리 기본 모델) 을 쓴다.
     """
-    raw = await audio.read()
+    raw = await _read_limited(audio)
     entry = ensure_loaded(model)
 
     if entry.get("type") == "slplab":
-        return _analyze_with_slplab(raw, canonical, audio.filename)
+        return await run_in_threadpool(_analyze_with_slplab, raw, canonical, audio.filename)
 
-    raw_result = _score_upload(raw, canonical, keep_silence, audio.filename)
+    # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
+    raw_result = await run_in_threadpool(_score_upload, raw, canonical, keep_silence, audio.filename)
     speech_rate, speech_rate_ratio = _classify_speech_rate(
         raw_result["canonical"], raw_result["duration_sec"]
     )
@@ -552,7 +561,7 @@ def _slplab_recognize(waveform: torch.Tensor) -> list[str]:
     if model is None or proc is None:
         raise HTTPException(503, "slplab model not loaded")
     device = next(model.parameters()).device
-    inputs = proc(waveform.cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+    inputs = proc(waveform.cpu().numpy(), sampling_rate=WAV2VEC2_SAMPLE_RATE, return_tensors="pt", padding=True)
     input_values = inputs.input_values.to(device)
     with torch.no_grad():
         logits = model(input_values).logits
@@ -588,11 +597,17 @@ async def tts(text: str = Form(...), lang: str = Form("en")):
         raise HTTPException(503, "TTS not available - install with: pip install gTTS")
     if not text or not text.strip():
         raise HTTPException(400, "text is required")
-    try:
+
+    # gTTS 는 외부 네트워크 합성을 수행하는 블로킹 호출이라 스레드풀로 보낸다.
+    def _synthesize() -> io.BytesIO:
         engine = gTTS(text=text, lang=lang)
         buf = io.BytesIO()
         engine.write_to_fp(buf)
         buf.seek(0)
+        return buf
+
+    try:
+        buf = await run_in_threadpool(_synthesize)
     except Exception as e:
         raise HTTPException(500, f"TTS failed: {e}")
     return StreamingResponse(buf, media_type="audio/mpeg")
@@ -609,7 +624,8 @@ def parse_args():
                     help="Device for slplab model. Defaults to --device value.")
     p.add_argument("--models-config", default=os.environ.get("ECHO_MODELS_CONFIG", DEFAULT_MODELS_CONFIG),
                     help="음소인식 모델 레지스트리 JSON. 없으면 --checkpoint / --slplab-model 로 합성한다.")
-    p.add_argument("--host", default="0.0.0.0")
+    # 기본은 로컬 바인딩. 리버스 프록시 뒤에서 외부 노출하려면 ECHO_HOST=0.0.0.0 으로 지정한다.
+    p.add_argument("--host", default=os.environ.get("ECHO_HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--reload", action="store_true")
     return p.parse_args()

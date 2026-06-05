@@ -19,6 +19,7 @@ at evaluation time only.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -30,13 +31,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from echo.config import Config
 from echo.data.dataset import PronunciationDataset, collate_batch
-from echo.models.model import BaselineModel
-from echo.models.film_model import FiLMModel
 from echo.evaluation.evaluator import frame_collapse_decode
+from echo.evaluation.loading import load_eval_model
 from echo.evaluation.metrics import calculate_sequence_error_rate, calculate_mdd_metrics
-from echo.utils.audio import create_attention_mask, compute_output_lengths, enable_specaugment
+from echo.utils.audio import create_attention_mask, compute_output_lengths
 from echo.constants import SILENCE_TOKENS
 
 
@@ -56,23 +55,6 @@ def parse_args():
     return p.parse_args()
 
 
-def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt.get('config', {})
-    model_type = cfg.get('model_type', 'baseline')
-    config = Config(
-        pretrained_model=cfg.get('pretrained_model', 'facebook/wav2vec2-base'),
-        model_type=model_type,
-        film_embed_dim=cfg.get('film_embed_dim', 128),
-    )
-    cls = FiLMModel if model_type == 'film' else BaselineModel
-    model = cls.from_config(config)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model = model.to(device).eval()
-    enable_specaugment(model, False)
-    return model, config
-
-
 def mix_noise_deterministic(
     waveform: torch.Tensor,
     file_key: str,
@@ -82,7 +64,9 @@ def mix_noise_deterministic(
 ) -> torch.Tensor:
     """Mixes one MUSAN noise clip into waveform at fixed SNR.
     Same file_key always gets same noise (reproducible across runs)."""
-    seed = abs(hash(file_key)) % (2**32)
+    # Python 의 hash() 는 PYTHONHASHSEED 로 프로세스마다 달라져 "재현 가능" 이 깨진다.
+    # hashlib 로 프로세스와 무관하게 같은 file_key → 같은 seed 를 보장한다.
+    seed = int(hashlib.md5(file_key.encode('utf-8')).hexdigest(), 16) % (2**32)
     rng = random.Random(seed)
     path = rng.choice(noise_files)
 
@@ -195,7 +179,7 @@ def main():
     device = torch.device(f'cuda:{args.device_id}')
 
     print(f'Loading: {args.checkpoint}')
-    model, config = load_model(args.checkpoint, device)
+    model, config = load_eval_model(args.checkpoint, device)
 
     with open(args.phoneme_map) as f:
         p2id = json.load(f)

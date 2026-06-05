@@ -9,13 +9,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from echo.config import Config
 from echo.data.dataset import PronunciationDataset, collate_batch
-from echo.models.model import BaselineModel
-from echo.models.film_model import FiLMModel
 from echo.evaluation.evaluator import frame_collapse_decode
+from echo.evaluation.loading import load_eval_model
 from echo.evaluation.metrics import calculate_mdd_metrics, calculate_sequence_error_rate
-from echo.utils.audio import create_attention_mask, compute_output_lengths, enable_specaugment
+from echo.utils.audio import create_attention_mask, compute_output_lengths
 from echo.constants import SILENCE_TOKENS
 
 
@@ -29,29 +27,12 @@ def parse_args():
     return p.parse_args()
 
 
-def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt.get('config', {})
-    model_type = cfg.get('model_type', 'baseline')
-    config = Config(
-        pretrained_model=cfg.get('pretrained_model', 'facebook/wav2vec2-base'),
-        model_type=model_type,
-        film_embed_dim=cfg.get('film_embed_dim', 128),
-    )
-    cls = FiLMModel if model_type == 'film' else BaselineModel
-    model = cls.from_config(config)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model = model.to(device).eval()
-    enable_specaugment(model, False)
-    return model, config
-
-
 def main():
     args = parse_args()
     device = torch.device(f'cuda:{args.device_id}')
 
     print(f'Loading: {args.checkpoint}')
-    model, config = load_model(args.checkpoint, device)
+    model, config = load_eval_model(args.checkpoint, device)
 
     with open(args.phoneme_map) as f:
         p2id = json.load(f)
