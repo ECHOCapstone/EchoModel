@@ -1,4 +1,4 @@
-"""ECHO 모델 서버 - 발음 평가(/analyze) + G2P(/g2p) + TTS(/tts).
+"""ECHO 모델 서버 - 음소 인식(/transcribe) + TTS(/tts).
 
 Run:
     # 모델 후보는 data/models.json 레지스트리에서 로드된다. 외부 노출은 ECHO_HOST=0.0.0.0 으로.
@@ -10,18 +10,17 @@ Run:
       --device cuda --port 8001
 
 모델 선택:
-    data/models.json (--models-config) 에 후보 모델을 두고, /analyze 의 model 폼 필드로 고른다.
+    data/models.json (--models-config) 에 후보 모델을 두고, /transcribe 의 model 폼 필드로 고른다.
     요청 시 교체 로드되므로 한 번에 하나만 메모리에 올라간다. 후보는 GET /models 로 조회.
 
 Endpoints:
-    GET  /healthz   서버/모델/TTS/G2P 가용 상태 (active_model 포함)
-    GET  /models    선택 가능한 음소인식 모델 후보 + 활성 모델
-    GET  /phonemes  학습된 음소 리스트
-    POST /analyze   발음 평가 - perceived/canonical/peak_softmax/alignment/errors/per (model 폼 필드로 모델 선택)
-    POST /score     기존 호환 - recognized 키 사용
-    POST /g2p       텍스트 → ARPAbet 음소 시퀀스 (CMUDict + OOV 신경망 폴백)
-    POST /tts       텍스트 → mp3 음성 (gTTS)
-    GET  /          데모 웹 UI
+    GET  /healthz     서버/모델/TTS 가용 상태 (active_model 포함)
+    GET  /models      선택 가능한 음소인식 모델 후보 + 활성 모델
+    GET  /phonemes    학습된 음소 리스트
+    POST /transcribe  음소 인식 - perceived/peak_softmax + 발화 속도 분류
+    POST /score       (deprecated) 기존 호환 - recognized 키 사용. 백엔드 호출처가 정리되면 제거 예정.
+    POST /tts         텍스트 → mp3 음성 (gTTS)
+    GET  /            데모 웹 UI
 """
 
 from __future__ import annotations
@@ -52,10 +51,8 @@ from pydantic import BaseModel, Field
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from echo.constants import DEFAULT_PHONEME_MAP_PATH, SILENCE_TOKENS
-from echo.evaluation.metrics import get_alignment_with_indices
 from echo.inference import PronunciationScorer
 from echo.utils.audio import WAV2VEC2_SAMPLE_RATE
-from echo.utils.g2p import G2P
 from echo.utils.phoneme_sanitize import sanitize_perceived
 
 logger = logging.getLogger("echo.serve")
@@ -100,7 +97,6 @@ except Exception:
 # 토큰만 매핑/드롭하도록 한다.
 state: dict = {
     "scorer": None,
-    "g2p": None,
     "slplab_model": None,
     "slplab_processor": None,
     "config": {},
@@ -123,22 +119,11 @@ _MODEL_SWITCH_LOCK = threading.RLock()
 _INFLIGHT_COND = threading.Condition()
 
 
-# /analyze 와 _score_upload 가 모두 같은 데이터 형태를 돌려주도록 한 곳에서 정의한다.
-class AlignmentOp(BaseModel):
-    op: str
-    canonical_index: Optional[int] = None
-    canonical: Optional[str] = None
-    recognized_index: Optional[int] = None
-    recognized: Optional[str] = None
-
-
-class AnalyzeResponse(BaseModel):
+# 음소 인식 결과. canonical 은 입력으로만 받고 응답에 포함하지 않는다 — alignment 책임은
+# 백엔드 LLM 으로 이동했고, 모델 서버는 perceived 시퀀스와 신뢰도, 발화 속도 메타만 돌려준다.
+class TranscribeResponse(BaseModel):
     perceived: List[str]
-    canonical: List[str] = Field(default_factory=list)
     peak_softmax: List[float] = Field(default_factory=list)
-    alignment: List[AlignmentOp] = Field(default_factory=list)
-    errors: List[AlignmentOp] = Field(default_factory=list)
-    per: Optional[float] = None
     duration_sec: float
     speech_rate: str
     speech_rate_ratio: Optional[float] = None
@@ -147,12 +132,17 @@ class AnalyzeResponse(BaseModel):
 
 
 class ScoreResponse(BaseModel):
-    """기존 호환 응답 — `recognized` 키 사용. peak_softmax 와 채점 결과를 함께 반환한다."""
+    """(deprecated) 기존 호환 응답 — `recognized` 키 사용. 백엔드 호출처 정리 후 제거 예정.
+
+    PronunciationScorer.score(...) 결과를 그대로 전달하며 alignment/errors/per 가
+    canonical 인자가 있을 때만 채워진다. 새 코드는 /transcribe 를 호출하고 alignment 는
+    백엔드 LLM 으로 위임한다.
+    """
     recognized: List[str]
     canonical: Optional[List[str]] = None
     peak_softmax: List[float] = Field(default_factory=list)
-    alignment: List[AlignmentOp] = Field(default_factory=list)
-    errors: List[AlignmentOp] = Field(default_factory=list)
+    alignment: List[dict] = Field(default_factory=list)
+    errors: List[dict] = Field(default_factory=list)
     per: Optional[float] = None
     filename: Optional[str] = None
     duration_sec: float
@@ -179,18 +169,7 @@ class HealthzResponse(BaseModel):
     device: Optional[str] = None
     num_phonemes: Optional[int] = None
     tts_available: bool
-    g2p_ready: bool
     slplab_loaded: bool
-
-
-class G2PWord(BaseModel):
-    word: str
-    phonemes: List[str]
-
-
-class G2PResponse(BaseModel):
-    phonemes: str
-    words: List[G2PWord]
 
 
 class PhonemesResponse(BaseModel):
@@ -572,12 +551,9 @@ def _decode_upload(raw: bytes, target_sr: int) -> torch.Tensor:
 async def lifespan(app: FastAPI):
     cfg = state["config"]
 
-    # G2P 는 인식 모델과 무관하게 독립 동작 — phoneme_map 만 있으면 로드한다.
-    # 백엔드가 /g2p 로 canonical 시퀀스를 만들어 /analyze 에 보내므로 항상 필요하다.
-    # 같은 파일을 sanitize 의 인벤토리로도 활용한다 (인벤토리 = blank/silence/<...> 제외한 표준 음소).
+    # phoneme_map 은 sanitize 의 인벤토리 단일 출처. 인벤토리 = blank/silence/<...> 제외한 표준 음소.
     pmap = cfg.get("phoneme_map", "")
     if pmap and pmap.lower() != "none" and os.path.isfile(pmap):
-        state["g2p"] = G2P.from_phoneme_map(pmap)
         with open(pmap, "r", encoding="utf-8") as f:
             phoneme_map_data = json.load(f)
         state["arpabet_inventory"] = frozenset(
@@ -585,13 +561,13 @@ async def lifespan(app: FastAPI):
             if not k.startswith("<") and k.lower() not in SILENCE_TOKENS
         )
         logger.info(
-            "G2P ready (phoneme_map=%s, inventory=%d phonemes)",
+            "Phoneme inventory loaded (phoneme_map=%s, inventory=%d phonemes)",
             pmap, len(state["arpabet_inventory"]),
         )
 
-    # 모델 레지스트리를 읽고 기본 모델을 메모리에 올린다. 이후 /analyze?model=<id> 로 교체된다.
-    # 기본 모델 로드 실패가 서버 부팅 자체를 막지 않게 한다 — /g2p / /tts 는 계속 동작하고
-    # /analyze 만 active_model_id 가 None 인 상태로 503 을 돌려준다.
+    # 모델 레지스트리를 읽고 기본 모델을 메모리에 올린다. 이후 /transcribe?model=<id> 로 교체된다.
+    # 기본 모델 로드 실패가 서버 부팅 자체를 막지 않게 한다 — /tts 는 계속 동작하고
+    # /transcribe 만 active_model_id 가 None 인 상태로 503 을 돌려준다.
     state["registry"] = _load_registry(cfg)
     default_id = state["registry"].get("default")
     if default_id:
@@ -600,12 +576,11 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error("Failed to load default model '%s': %s", default_id, exc)
     else:
-        logger.warning("No recognition model in registry — /analyze will return 503")
+        logger.warning("No recognition model in registry — /transcribe will return 503")
 
     yield
     with _MODEL_SWITCH_LOCK:
         _unload_current()
-    state["g2p"] = None
     state["arpabet_inventory"] = frozenset()
 
 
@@ -647,7 +622,6 @@ def healthz():
         device=str(scorer.device) if scorer else None,
         num_phonemes=len(scorer.phoneme_to_id) if scorer else None,
         tts_available=_TTS_AVAILABLE,
-        g2p_ready=state["g2p"] is not None,
         slplab_loaded=state["slplab_model"] is not None,
     )
 
@@ -721,7 +695,8 @@ async def score(
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
 ):
-    """기존 호환 응답: recognized 키 + peak_softmax 포함. 모델 선택은 활성 모델을 그대로 따른다."""
+    """(deprecated) 기존 호환 응답: recognized 키 + alignment/errors/per. 신규 코드는 /transcribe 를 쓰고
+    alignment 는 백엔드 LLM 으로 위임한다. 활성 모델을 그대로 따른다."""
     raw = await _read_limited(audio)
     # 활성 모델 그대로 사용 — expected_model_id 를 비워두면 추론 함수가 현재 active_model 만 검증한다.
     result = await run_in_threadpool(
@@ -761,38 +736,15 @@ def _classify_speech_rate(
     return ("normal", round(ratio, 2))
 
 
-def _build_alignment(canonical_list: list[str], perceived_list: list[str]) -> dict:
-    """Levenshtein 정렬로 기존 PronunciationScorer.diagnose 와 동일한 alignment/errors 구조를 만든다."""
-    op_label = {"=": "correct", "S": "substitution", "D": "deletion", "I": "insertion"}
-    align = get_alignment_with_indices(canonical_list, perceived_list)
-    alignment, errors = [], []
-    for op, ref_idx, hyp_idx in align:
-        item = {
-            "op": op_label[op],
-            "canonical_index": ref_idx,
-            "canonical": canonical_list[ref_idx] if ref_idx is not None else None,
-            "recognized_index": hyp_idx,
-            "recognized": perceived_list[hyp_idx] if hyp_idx is not None else None,
-        }
-        alignment.append(item)
-        if op != "=":
-            errors.append(item)
-    num_errors = sum(1 for op, _, _ in align if op != "=")
-    per = round(num_errors / len(canonical_list), 4) if canonical_list else 0.0
-    return {"alignment": alignment, "errors": errors, "per": per}
-
-
-def _analyze_with_slplab(
+def _transcribe_with_slplab(
     raw: bytes,
-    canonical: Optional[str],
     keep_silence: bool,
     filename: Optional[str],
     expected_model_id: Optional[str] = None,
 ) -> dict:
-    """slplab 모델로 인식 후 ECHO 모델 응답과 동일한 형식으로 정렬·메타까지 묶어 돌려준다.
+    """slplab 모델로 인식 후 sanitize 통과한 표준 ARPABET 시퀀스 + peak softmax 를 돌려준다.
 
-    sanitize 단계가 vocab 잡음을 흡수하므로 학습자에게 표준 ARPABET 시퀀스만 노출된다.
-    keep_silence 가 False 면 silence 토큰을 제거해 ECHO 경로와 정합한 채점 결과를 만든다.
+    keep_silence 가 False 면 silence 토큰을 제거해 ECHO 경로와 정합한 결과를 만든다.
     """
     if not raw:
         raise HTTPException(400, "Empty audio upload")
@@ -822,37 +774,26 @@ def _analyze_with_slplab(
         perceived = [p for p, _ in kept]
         peak_softmax = [pk for _, pk in kept]
 
-    canonical_list: list[str] = []
-    if canonical and canonical.strip():
-        canonical_list = canonical.strip().split()
-
-    diag = _build_alignment(canonical_list, perceived) if canonical_list else {
-        "alignment": [], "errors": [], "per": 0.0,
-    }
     duration_sec = float(waveform.shape[0] / sr)
-    speech_rate, speech_rate_ratio = _classify_speech_rate(canonical_list, duration_sec)
-
     return {
         "perceived": perceived,
-        "canonical": canonical_list,
         "peak_softmax": peak_softmax,
-        "alignment": diag["alignment"],
-        "errors": diag["errors"],
-        "per": diag["per"],
         "duration_sec": duration_sec,
-        "speech_rate": speech_rate,
-        "speech_rate_ratio": speech_rate_ratio,
     }
 
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
     model: Optional[str] = Form(None),
 ):
-    """백엔드 연동용 응답: perceived 키 + peak_softmax + 정렬 결과 + 발화 속도 분류.
+    """음소 인식 결과 + 발화 속도 분류.
+
+    perceived 는 sanitize 통과한 표준 ARPABET 시퀀스, peak_softmax 는 perceived 와 길이 일치.
+    canonical 은 발화 속도 분류(음소 개수 / 실제 duration 비율)에만 쓰이며 응답에는 포함되지 않는다.
+    canonical 이 비면 speech_rate 는 'unknown'.
 
     model 폼 필드로 레지스트리의 모델 id 를 지정하면 그 모델로 (필요 시 교체 로드 후) 인식한다.
     생략하면 현재 활성 모델(없으면 레지스트리 기본 모델) 을 쓴다.
@@ -864,28 +805,29 @@ async def analyze(
 
     if entry_type == "slplab":
         result = await run_in_threadpool(
-            _analyze_with_slplab, raw, canonical, keep_silence, audio.filename, entry_id,
+            _transcribe_with_slplab, raw, keep_silence, audio.filename, entry_id,
         )
-        result["model_id"] = entry_id
-        result["model_type"] = entry_type
-        return AnalyzeResponse(**result)
+        perceived = result["perceived"]
+        peak_softmax = result["peak_softmax"]
+        duration_sec = result["duration_sec"]
+    else:
+        # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
+        # canonical 인자는 PronunciationScorer 내부의 PER/alignment 계산만 트리거하므로,
+        # /transcribe 경로에서는 굳이 전달하지 않는다 (어차피 응답에서 버린다).
+        raw_result = await run_in_threadpool(
+            _score_upload, raw, None, keep_silence, audio.filename, entry_id,
+        )
+        perceived = raw_result["recognized"]
+        peak_softmax = raw_result.get("peak_softmax", [])
+        duration_sec = raw_result["duration_sec"]
 
-    # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
-    raw_result = await run_in_threadpool(
-        _score_upload, raw, canonical, keep_silence, audio.filename, entry_id,
-    )
-    canonical_list = raw_result.get("canonical") or []
-    speech_rate, speech_rate_ratio = _classify_speech_rate(
-        canonical_list, raw_result["duration_sec"]
-    )
-    return AnalyzeResponse(
-        perceived=raw_result["recognized"],
-        canonical=canonical_list,
-        peak_softmax=raw_result.get("peak_softmax", []),
-        alignment=raw_result["alignment"],
-        errors=raw_result["errors"],
-        per=raw_result["per"],
-        duration_sec=raw_result["duration_sec"],
+    canonical_list = canonical.strip().split() if canonical and canonical.strip() else []
+    speech_rate, speech_rate_ratio = _classify_speech_rate(canonical_list, duration_sec)
+
+    return TranscribeResponse(
+        perceived=perceived,
+        peak_softmax=peak_softmax,
+        duration_sec=duration_sec,
         speech_rate=speech_rate,
         speech_rate_ratio=speech_rate_ratio,
         model_id=entry_id,
@@ -938,26 +880,6 @@ def _slplab_recognize_with(model, processor, waveform: torch.Tensor) -> tuple[li
         peaks.append(float(pk))
         prev = tid
     return tokens, peaks
-
-
-@app.post("/g2p", response_model=G2PResponse)
-async def g2p(text: str = Form(...)):
-    """텍스트(단어 또는 문장) 를 모델 인벤토리에 맞춘 ARPAbet 음소 시퀀스로 변환한다.
-
-    응답:
-        phonemes: 공백으로 이어 붙인 전체 음소 시퀀스. /analyze 의 canonical 인자에 그대로 사용.
-        words:    원문 단어와 그 단어의 음소 목록. UI 에서 단어별 강조에 사용.
-    """
-    converter = state["g2p"]
-    if converter is None:
-        raise HTTPException(503, "G2P not ready")
-    if not text or not text.strip():
-        raise HTTPException(400, "text is required")
-    entries = converter.convert(text)
-    return G2PResponse(
-        phonemes=" ".join(p for entry in entries for p in entry.phonemes),
-        words=[G2PWord(word=entry.word, phonemes=entry.phonemes) for entry in entries],
-    )
 
 
 @app.post("/tts")

@@ -17,6 +17,3 @@ gTTS==2.5.4
 transformers==5.5.3
 # 학습/평가 진행률 출력 및 dataset 빌드 로그.
 tqdm==4.67.3
-
-# CMU Pronouncing Dictionary 기반 G2P. 사전 미등재 단어는 내장 신경망 폴백으로 처리.
-g2p-en==2.1.0
