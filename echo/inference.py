@@ -22,15 +22,20 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Union
 
+import logging
+
 import soundfile as sf
 import torch
 import torchaudio
 
-from .constants import SILENCE_TOKENS
+from .constants import BLANK_TOKEN_ID, SILENCE_TOKENS, infer_num_phonemes
 from .evaluation.metrics import get_alignment_with_indices
 from .models.film_model import FiLMModel
 from .models.model import BaselineModel
-from .utils.audio import create_attention_mask
+from .utils.audio import WAV2VEC2_SAMPLE_RATE, create_attention_mask
+
+
+logger = logging.getLogger(__name__)
 
 
 AudioInput = Union[str, torch.Tensor, "np.ndarray"]  # noqa: F821
@@ -66,10 +71,17 @@ class PronunciationScorer:
         phoneme_to_id: Dict[str, int],
         id_to_phoneme: Dict[int, str],
         device: Union[str, torch.device] = "cuda",
-        sampling_rate: int = 16000,
-        blank_id: int = 0,
+        sampling_rate: int = WAV2VEC2_SAMPLE_RATE,
+        blank_id: int = BLANK_TOKEN_ID,
     ):
-        self.device = torch.device(device if torch.cuda.is_available() or str(device) == "cpu" else "cpu")
+        # 요청 device 가 cuda 인데 cuda 가 없으면 cpu 로 떨어진다 — silent migration 이 아니라
+        # 명시적으로 경고 로그를 남겨 운영자가 GPU 부재를 알아챌 수 있게 한다.
+        requested = torch.device(device)
+        if requested.type == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available; falling back to CPU for PronunciationScorer.")
+            self.device = torch.device("cpu")
+        else:
+            self.device = requested
         self.model = model.to(self.device).eval()
         self.phoneme_to_id = phoneme_to_id
         self.id_to_phoneme = id_to_phoneme
@@ -92,7 +104,21 @@ class PronunciationScorer:
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         saved_cfg = ckpt.get("config", {}) or {}
-        num_phonemes = saved_cfg.get("num_phonemes", 42)
+        # saved_cfg 의 num_phonemes 를 1순위로 신뢰한다 — 구 체크포인트가 다른 vocab 크기로 학습됐을
+        # 수 있어 phoneme_to_id 길이로 임의 덮어쓰면 weight shape 가 맞지 않아 load 가 실패한다.
+        # saved_cfg 에 없을 때만 phoneme_to_id 길이로 보강. 그것도 없으면 명시적으로 raise.
+        if "num_phonemes" in saved_cfg:
+            num_phonemes = saved_cfg["num_phonemes"]
+        elif phoneme_to_id:
+            num_phonemes = infer_num_phonemes(phoneme_to_id)
+            logger.warning(
+                "checkpoint %s has no num_phonemes in saved config; inferring %d from phoneme map %s",
+                checkpoint_path, num_phonemes, phoneme_map_path,
+            )
+        else:
+            raise ValueError(
+                f"checkpoint {checkpoint_path} is missing num_phonemes and phoneme map is empty"
+            )
         hidden_dim = saved_cfg.get("hidden_dim", 768)
         dropout = saved_cfg.get("dropout", 0.1)
         pretrained = saved_cfg.get("pretrained_model", pretrained_model)
@@ -123,7 +149,7 @@ class PronunciationScorer:
             phoneme_to_id=phoneme_to_id,
             id_to_phoneme=id_to_phoneme,
             device=device,
-            sampling_rate=saved_cfg.get("sampling_rate", 16000),
+            sampling_rate=saved_cfg.get("sampling_rate", WAV2VEC2_SAMPLE_RATE),
         )
 
     def _load_waveform(self, audio: AudioInput) -> torch.Tensor:

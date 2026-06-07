@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import gc
+import hashlib
 import io
 import json
 import logging
@@ -36,7 +37,7 @@ import os
 import pathlib
 import threading
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import soundfile as sf
 import torch
@@ -46,10 +47,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
-from echo.constants import SILENCE_TOKENS
+from echo.constants import DEFAULT_PHONEME_MAP_PATH, SILENCE_TOKENS
 from echo.evaluation.metrics import get_alignment_with_indices
 from echo.inference import PronunciationScorer
 from echo.utils.audio import WAV2VEC2_SAMPLE_RATE
@@ -63,7 +65,7 @@ logger = logging.getLogger("echo.serve")
 # 레지스트리에서 모델을 로드하며, slplab 모델만으로도 서버가 동작한다. 머신 종속 절대경로를 기본값으로
 # 박아두면 모델 재학습 시 즉시 깨지므로 기본값은 "none" 으로 둔다.
 DEFAULT_CHECKPOINT = "none"
-DEFAULT_PHONEME_MAP = "data/phoneme_to_id.json"
+DEFAULT_PHONEME_MAP = DEFAULT_PHONEME_MAP_PATH
 DEFAULT_PORT = 8001
 
 # 업로드 오디오 최대 크기(바이트). 무제한 read 로 인한 메모리 고갈을 막는다. 환경변수로 조정 가능.
@@ -105,13 +107,94 @@ state: dict = {
     "registry": {"models": [], "default": None},
     "active_model_id": None,
     "arpabet_inventory": frozenset(),
+    # checkpoint sha256 fingerprint 캐시 (lazy). 같은 파일을 매번 다시 해시하지 않게.
+    "fingerprints": {},
+    # in-flight 추론 수. swap 이 새 모델 로드 직전 0 까지 대기하는 게이트로 쓰인다.
+    "inflight": 0,
 }
 
 
-# 모델 교체와 추론을 직렬화하는 락. 모델 A 추론 도중 다른 요청이 _unload_current 를 호출해
-# GPU 텐서가 GC 되거나 두 모델이 동시에 GPU 로 올라가 OOM 이 발생하는 race 를 차단한다.
-# RLock 이라 같은 스레드에서 ensure_loaded 와 추론을 중첩으로 잡아도 안전하다.
+# swap (writer) 직렬화 락 — _switch_model 만 잡는다. 추론은 짧은 critical section 에서
+# active 모델 ref 만 캡처하고 곧바로 락을 놓는다. 추론 자체는 락 밖에서 진행되므로 두
+# 요청이 같은 모델로 들어왔을 때 한쪽이 다른 쪽을 막지 않는다.
 _MODEL_SWITCH_LOCK = threading.RLock()
+
+# in-flight 추론 카운터 보호용 condition. swap 이 in-flight 가 0 이 될 때까지 wait 한다.
+_INFLIGHT_COND = threading.Condition()
+
+
+# /analyze 와 _score_upload 가 모두 같은 데이터 형태를 돌려주도록 한 곳에서 정의한다.
+class AlignmentOp(BaseModel):
+    op: str
+    canonical_index: Optional[int] = None
+    canonical: Optional[str] = None
+    recognized_index: Optional[int] = None
+    recognized: Optional[str] = None
+
+
+class AnalyzeResponse(BaseModel):
+    perceived: List[str]
+    canonical: List[str] = Field(default_factory=list)
+    peak_softmax: List[float] = Field(default_factory=list)
+    alignment: List[AlignmentOp] = Field(default_factory=list)
+    errors: List[AlignmentOp] = Field(default_factory=list)
+    per: Optional[float] = None
+    duration_sec: float
+    speech_rate: str
+    speech_rate_ratio: Optional[float] = None
+    model_id: Optional[str] = None
+    model_type: Optional[str] = None
+
+
+class ScoreResponse(BaseModel):
+    """기존 호환 응답 — `recognized` 키 사용. peak_softmax 와 채점 결과를 함께 반환한다."""
+    recognized: List[str]
+    canonical: Optional[List[str]] = None
+    peak_softmax: List[float] = Field(default_factory=list)
+    alignment: List[AlignmentOp] = Field(default_factory=list)
+    errors: List[AlignmentOp] = Field(default_factory=list)
+    per: Optional[float] = None
+    filename: Optional[str] = None
+    duration_sec: float
+
+
+class ModelEntry(BaseModel):
+    id: str
+    label: str
+    type: Optional[str] = None
+    # checkpoint sha256 (lazy fingerprint). slplab 같이 hf_id 만 있는 모델은 None.
+    sha256: Optional[str] = None
+
+
+class ModelsResponse(BaseModel):
+    active: Optional[str] = None
+    default: Optional[str] = None
+    models: List[ModelEntry]
+
+
+class HealthzResponse(BaseModel):
+    ok: bool
+    active_model_id: Optional[str] = None
+    active_type: Optional[str] = None
+    device: Optional[str] = None
+    num_phonemes: Optional[int] = None
+    tts_available: bool
+    g2p_ready: bool
+    slplab_loaded: bool
+
+
+class G2PWord(BaseModel):
+    word: str
+    phonemes: List[str]
+
+
+class G2PResponse(BaseModel):
+    phonemes: str
+    words: List[G2PWord]
+
+
+class PhonemesResponse(BaseModel):
+    phonemes: List[str]
 
 
 def _load_registry(cfg: dict) -> dict:
@@ -151,56 +234,175 @@ def _entry_by_id(model_id: Optional[str]) -> Optional[dict]:
 def _unload_current() -> None:
     """현재 로드된 인식 모델을 내려 GPU/RAM 을 회수한다 (G2P 는 모델과 무관하므로 유지).
 
-    호출자는 반드시 `_MODEL_SWITCH_LOCK` 을 잡은 상태여야 한다 — 추론 중인 다른 요청과의
-    race 를 막기 위한 전제다.
+    GPU 의 텐서가 즉시 회수되도록 모델을 cpu 로 옮긴 뒤 None 으로 끊고, 파이썬 GC + CUDA 캐시
+    회수를 명시적으로 호출한다. 호출자는 `_MODEL_SWITCH_LOCK` 을 잡은 상태여야 한다.
     """
-    state["scorer"] = None
-    state["slplab_model"] = None
+    scorer = state.get("scorer")
+    if scorer is not None:
+        try:
+            scorer.model.to("cpu")
+        except Exception as exc:
+            logger.warning("scorer.model.to(cpu) failed (ignored): %s", exc)
+        state["scorer"] = None
+    slplab_model = state.get("slplab_model")
+    if slplab_model is not None:
+        try:
+            slplab_model.to("cpu")
+        except Exception as exc:
+            logger.warning("slplab_model.to(cpu) failed (ignored): %s", exc)
+        state["slplab_model"] = None
     state["slplab_processor"] = None
     state["active_model_id"] = None
-    # 파이썬 GC 를 한 번 돌려 모델이 참조하던 텐서가 즉시 해제되도록 한다. 그 후 CUDA 캐시 회수.
+    # 모델이 참조하던 텐서가 즉시 해제되도록 GC 한 번 + CUDA 캐시 회수.
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _load_echo_model(entry: dict, cfg: dict) -> None:
+    state["scorer"] = PronunciationScorer.from_checkpoint(
+        checkpoint_path=entry["checkpoint"],
+        phoneme_map_path=entry.get("phoneme_map", cfg.get("phoneme_map", DEFAULT_PHONEME_MAP)),
+        device=cfg["device"],
+    )
+
+
+def _load_slplab_model(entry: dict, cfg: dict) -> None:
+    device = cfg.get("slplab_device", cfg["device"])
+    state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(entry["hf_id"])
+    state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(entry["hf_id"]).to(device).eval()
+
+
+# 모델 type → 로더 dispatch. 새 type 추가 시 이 dict 에 항목만 늘리면 된다 (OCP).
+_MODEL_LOADERS: Dict[str, Callable[[dict, dict], None]] = {
+    "echo": _load_echo_model,
+    "slplab": _load_slplab_model,
+}
 
 
 def _load_model(entry: dict) -> None:
     """레지스트리 entry 의 type 에 따라 인식 모델을 메모리에 올린다."""
     cfg = state["config"]
     mtype = entry.get("type")
-    if mtype == "echo":
-        state["scorer"] = PronunciationScorer.from_checkpoint(
-            checkpoint_path=entry["checkpoint"],
-            phoneme_map_path=entry.get("phoneme_map", cfg.get("phoneme_map", DEFAULT_PHONEME_MAP)),
-            device=cfg["device"],
-        )
-    elif mtype == "slplab":
-        device = cfg.get("slplab_device", cfg["device"])
-        state["slplab_processor"] = Wav2Vec2Processor.from_pretrained(entry["hf_id"])
-        state["slplab_model"] = Wav2Vec2ForCTC.from_pretrained(entry["hf_id"]).to(device).eval()
-    else:
+    loader = _MODEL_LOADERS.get(mtype)
+    if loader is None:
         raise HTTPException(400, f"unknown model type: {mtype}")
+    loader(entry, cfg)
     state["active_model_id"] = entry["id"]
     logger.info("Recognition model ready: %s (type=%s)", entry["id"], mtype)
 
 
-def ensure_loaded(model_id: Optional[str]) -> dict:
-    """요청한 모델을 보장 로드한다. 이미 활성이면 그대로, 다르면 기존 것을 내리고 교체 로드한다.
+def _checkpoint_fingerprint(path: str) -> Optional[str]:
+    """checkpoint 파일의 sha256 fingerprint (lazy 계산 + state 캐시)."""
+    if not path or not os.path.isfile(path):
+        return None
+    cache = state["fingerprints"]
+    cached = cache.get(path)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if cached and cached.get("mtime") == mtime:
+        return cached["sha256"]
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    cache[path] = {"sha256": digest, "mtime": mtime}
+    return digest
 
-    model_id 가 None 이면 활성 모델, 그것도 없으면 레지스트리 기본 모델을 쓴다. 활성 entry 를 반환.
-    동시에 들어온 두 요청이 서로 다른 모델을 부르거나 한 요청이 추론 중인데 다른 요청이 교체를
-    시도하는 race 를 막기 위해 `_MODEL_SWITCH_LOCK` 안에서만 상태를 갱신한다.
+
+def _switch_model(target_id: str) -> dict:
+    """active 모델이 target_id 와 다르면 in-flight 추론이 끝날 때까지 대기 후 교체 로드.
+
+    in-flight 가 0 이 될 때까지 condition variable 로 wait — 추론 중인 텐서가 GPU 에서 사라지는
+    race 를 차단한다. 같은 모델이 이미 활성이면 즉시 entry 만 돌려준다.
+    """
+    entry = _entry_by_id(target_id)
+    if entry is None:
+        raise HTTPException(400, f"unknown model: {target_id}")
+    with _MODEL_SWITCH_LOCK:
+        if state["active_model_id"] == entry["id"] and (
+            state.get("scorer") is not None or state.get("slplab_model") is not None
+        ):
+            return entry
+        logger.info("Switching recognition model: %s -> %s", state["active_model_id"], entry["id"])
+        # in-flight 추론이 끝날 때까지 대기. 새 요청은 active_model_id 가 잠시 None 인 동안 503 으로
+        # 거절되지 않고, capture 단계에서 lock 을 잡으려 하다 자연스럽게 대기한다.
+        with _INFLIGHT_COND:
+            while state["inflight"] > 0:
+                _INFLIGHT_COND.wait()
+        _unload_current()
+        _load_model(entry)
+        return entry
+
+
+def ensure_loaded(model_id: Optional[str]) -> dict:
+    """요청한 모델을 보장 로드한다. 이미 활성이면 그대로, 다르면 in-flight 가 끝난 뒤 교체.
+
+    model_id 가 None 이면 활성 모델, 그것도 없으면 레지스트리 기본 모델을 쓴다.
     """
     with _MODEL_SWITCH_LOCK:
         target_id = model_id or state["active_model_id"] or state["registry"].get("default")
-        entry = _entry_by_id(target_id)
+    if target_id is None:
+        raise HTTPException(400, "no model id and no default in registry")
+    return _switch_model(target_id)
+
+
+def _capture_active(expected_model_id: Optional[str]) -> Tuple[dict, Any, Any, Any]:
+    """짧은 critical section 에서 active 모델 ref 를 캡처 + in-flight 카운터 증가.
+
+    expected_model_id 가 active 와 다르면 캡처 전에 swap 해 두 추론이 다른 모델로 갈리지 않게 한다.
+    반환: (entry, scorer, slplab_model, slplab_processor). 사용 후에는 반드시
+    `_release_active()` 를 호출해 in-flight 를 감소시켜야 swap 이 진행될 수 있다.
+    """
+    if expected_model_id is not None and state["active_model_id"] != expected_model_id:
+        _switch_model(expected_model_id)
+    with _MODEL_SWITCH_LOCK:
+        entry = _entry_by_id(state["active_model_id"])
         if entry is None:
-            raise HTTPException(400, f"unknown model: {target_id}")
-        if state["active_model_id"] != entry["id"]:
-            logger.info("Switching recognition model: %s -> %s", state["active_model_id"], entry["id"])
-            _unload_current()
-            _load_model(entry)
-        return entry
+            raise HTTPException(503, "no active recognition model")
+        with _INFLIGHT_COND:
+            state["inflight"] += 1
+        return (
+            entry,
+            state.get("scorer"),
+            state.get("slplab_model"),
+            state.get("slplab_processor"),
+        )
+
+
+def _release_active() -> None:
+    """capture 한 ref 를 놓는다. in-flight 가 0 이 되면 swap 대기자를 깨운다."""
+    with _INFLIGHT_COND:
+        state["inflight"] = max(0, state["inflight"] - 1)
+        if state["inflight"] == 0:
+            _INFLIGHT_COND.notify_all()
+
+
+def _sanitize_with_peaks(
+    tokens: List[str],
+    peaks: List[float],
+    inventory: frozenset,
+) -> Tuple[List[str], List[float]]:
+    """(token, peak) 쌍을 함께 sanitize 한다.
+
+    `sanitize_perceived` 가 단일 입력 토큰을 0개 또는 여러 개의 표준 음소로 바꿀 가능성에 대비해,
+    토큰 단위로 호출하고 출력 개수만큼 입력 peak 를 복제한다. 이로써 peak_softmax 와 perceived 의
+    길이가 항상 일치한다.
+    """
+    if len(tokens) != len(peaks):
+        raise ValueError(
+            f"tokens / peaks length mismatch: {len(tokens)} vs {len(peaks)}"
+        )
+    out_tokens: List[str] = []
+    out_peaks: List[float] = []
+    for token, peak in zip(tokens, peaks):
+        cleaned = sanitize_perceived([token], inventory)
+        out_tokens.extend(cleaned)
+        out_peaks.extend([peak] * len(cleaned))
+    return out_tokens, out_peaks
 
 
 # 디버그용 dump 디렉토리. 환경변수 ECHO_DUMP_DIR 가 설정되어 있을 때만 활성화.
@@ -430,39 +632,52 @@ def index():
     return FileResponse(path)
 
 
-@app.get("/healthz")
+@app.get("/healthz", response_model=HealthzResponse)
 def healthz():
     scorer = state["scorer"]
-    return {
-        "ok": scorer is not None or state["slplab_model"] is not None,
-        "active_model": state["active_model_id"],
-        "device": str(scorer.device) if scorer else None,
-        "num_phonemes": len(scorer.phoneme_to_id) if scorer else None,
-        "tts_available": _TTS_AVAILABLE,
-        "g2p_ready": state["g2p"] is not None,
-        "slplab_ready": state["slplab_model"] is not None,
-    }
+    active_id = state["active_model_id"]
+    active_type = None
+    if active_id:
+        entry = _entry_by_id(active_id)
+        active_type = entry.get("type") if entry else None
+    return HealthzResponse(
+        ok=scorer is not None or state["slplab_model"] is not None,
+        active_model_id=active_id,
+        active_type=active_type,
+        device=str(scorer.device) if scorer else None,
+        num_phonemes=len(scorer.phoneme_to_id) if scorer else None,
+        tts_available=_TTS_AVAILABLE,
+        g2p_ready=state["g2p"] is not None,
+        slplab_loaded=state["slplab_model"] is not None,
+    )
 
 
-@app.get("/models")
+@app.get("/models", response_model=ModelsResponse)
 def models():
     """선택 가능한 음소인식 모델 후보 + 현재 활성 모델. 백엔드/어드민이 드롭다운을 그릴 때 쓴다."""
     reg = state["registry"]
-    return {
-        "active": state["active_model_id"],
-        "models": [
-            {"id": m["id"], "label": m.get("label", m["id"]), "type": m.get("type")}
-            for m in reg.get("models", [])
-        ],
-    }
+    entries: List[ModelEntry] = []
+    for m in reg.get("models", []):
+        sha = _checkpoint_fingerprint(m.get("checkpoint", "")) if m.get("type") == "echo" else None
+        entries.append(ModelEntry(
+            id=m["id"],
+            label=m.get("label", m["id"]),
+            type=m.get("type"),
+            sha256=sha,
+        ))
+    return ModelsResponse(
+        active=state["active_model_id"],
+        default=reg.get("default"),
+        models=entries,
+    )
 
 
-@app.get("/phonemes")
+@app.get("/phonemes", response_model=PhonemesResponse)
 def phonemes():
     scorer = state["scorer"]
     if scorer is None:
         raise HTTPException(503, "Scorer not ready")
-    return {"phonemes": sorted(scorer.phoneme_to_id.keys())}
+    return PhonemesResponse(phonemes=sorted(scorer.phoneme_to_id.keys()))
 
 
 def _score_upload(
@@ -472,14 +687,11 @@ def _score_upload(
     filename: Optional[str],
     expected_model_id: Optional[str] = None,
 ) -> dict:
-    """ECHO 추론기로 발음 평가. 디코딩 → 모델 호출 → 메타 부착의 공통 처리."""
+    """ECHO 추론기로 발음 평가. capture 한 scorer ref 만 들고 락 밖에서 추론한다."""
     if not raw:
         raise HTTPException(400, "Empty audio upload")
-    # 추론 전 모델 교체 race 를 막기 위해 lock 안에서 모델 참조를 캡처하고 추론까지 마친다.
-    with _MODEL_SWITCH_LOCK:
-        if expected_model_id and state["active_model_id"] != expected_model_id:
-            ensure_loaded(expected_model_id)
-        scorer = state["scorer"]
+    _, scorer, _, _ = _capture_active(expected_model_id)
+    try:
         if scorer is None:
             raise HTTPException(503, "Scorer not ready")
         waveform = _decode_upload(raw, scorer.sampling_rate)
@@ -491,6 +703,8 @@ def _score_upload(
         result["filename"] = filename
         result["duration_sec"] = float(waveform.shape[0] / scorer.sampling_rate)
         return result
+    finally:
+        _release_active()
 
 
 # 업로드를 최대 크기까지만 읽어 메모리 고갈을 막는다. 한도를 넘으면 413 으로 거절한다.
@@ -501,7 +715,7 @@ async def _read_limited(audio: UploadFile) -> bytes:
     return data
 
 
-@app.post("/score")
+@app.post("/score", response_model=ScoreResponse)
 async def score(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
@@ -510,9 +724,10 @@ async def score(
     """기존 호환 응답: recognized 키 + peak_softmax 포함. 모델 선택은 활성 모델을 그대로 따른다."""
     raw = await _read_limited(audio)
     # 활성 모델 그대로 사용 — expected_model_id 를 비워두면 추론 함수가 현재 active_model 만 검증한다.
-    return await run_in_threadpool(
+    result = await run_in_threadpool(
         _score_upload, raw, canonical, keep_silence, audio.filename, state["active_model_id"],
     )
+    return ScoreResponse(**result)
 
 
 # 발화 속도 분류 기준. 학습자 데이터를 토대로 다음과 같이 보정한다.
@@ -526,10 +741,17 @@ _FAST_RATIO_THRESHOLD = 0.55
 _SLOW_RATIO_THRESHOLD = 1.8
 
 
-def _classify_speech_rate(canonical_phonemes: list, duration_sec: float) -> tuple[str, float]:
-    """canonical 음소 개수 대비 실제 duration 비율로 발화 속도 레이블을 정한다."""
+def _classify_speech_rate(
+    canonical_phonemes: list,
+    duration_sec: float,
+) -> tuple[str, Optional[float]]:
+    """canonical 음소 개수 대비 실제 duration 비율로 발화 속도 레이블을 정한다.
+
+    canonical 이 비어 있거나 duration 이 0 이하이면 분류 자체가 불가능하므로 "unknown" 을 반환.
+    이 경우 ratio 는 None — 호출 측에서 명시적으로 unknown 으로 노출한다.
+    """
     if not canonical_phonemes or duration_sec <= 0.0:
-        return ("normal", 1.0)
+        return ("unknown", None)
     expected_sec = max(0.2, len(canonical_phonemes) / _PHONEMES_PER_SECOND_NORMAL)
     ratio = duration_sec / expected_sec
     if ratio < _FAST_RATIO_THRESHOLD:
@@ -576,26 +798,21 @@ def _analyze_with_slplab(
         raise HTTPException(400, "Empty audio upload")
     # slplab vocab 은 16kHz 고정이라 ECHO scorer 의 sampling_rate 가 아닌 상수를 사용한다.
     sr = WAV2VEC2_SAMPLE_RATE
-    with _MODEL_SWITCH_LOCK:
-        if expected_model_id and state["active_model_id"] != expected_model_id:
-            ensure_loaded(expected_model_id)
-        if state["slplab_model"] is None or state["slplab_processor"] is None:
+    _, _, slplab_model, slplab_processor = _capture_active(expected_model_id)
+    try:
+        if slplab_model is None or slplab_processor is None:
             raise HTTPException(503, "slplab model not loaded")
         waveform = _decode_upload(raw, sr)
         if waveform.numel() == 0:
             raise HTTPException(400, "Decoded audio is empty")
         _dump_audio(raw, waveform, sr, filename)
-
-        raw_tokens, raw_peaks = _slplab_recognize(waveform)
+        raw_tokens, raw_peaks = _slplab_recognize_with(slplab_model, slplab_processor, waveform)
+    finally:
+        _release_active()
 
     # vocab 잡음 정리는 락 밖에서 — 모델 자원을 더 이상 만지지 않는다.
     inventory = state["arpabet_inventory"]
-    sanitized: list[str] = []
-    sanitized_peaks: list[float] = []
-    for token, peak in zip(raw_tokens, raw_peaks):
-        for clean_token in sanitize_perceived([token], inventory):
-            sanitized.append(clean_token)
-            sanitized_peaks.append(peak)
+    sanitized, sanitized_peaks = _sanitize_with_peaks(raw_tokens, raw_peaks, inventory)
 
     if keep_silence:
         perceived = sanitized
@@ -628,7 +845,7 @@ def _analyze_with_slplab(
     }
 
 
-@app.post("/analyze")
+@app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
     audio: UploadFile = File(...),
     canonical: Optional[str] = Form(None),
@@ -643,46 +860,47 @@ async def analyze(
     raw = await _read_limited(audio)
     entry = ensure_loaded(model)
     entry_id = entry["id"]
+    entry_type = entry.get("type")
 
-    # 추론 함수는 자체 락 안에서 active_model_id 가 expected 와 다르면 다시 ensure_loaded 를
-    # 부르므로, ensure_loaded 와 추론 사이에 다른 요청이 모델을 바꿔도 안전하다.
-    if entry.get("type") == "slplab":
-        return await run_in_threadpool(
+    if entry_type == "slplab":
+        result = await run_in_threadpool(
             _analyze_with_slplab, raw, canonical, keep_silence, audio.filename, entry_id,
         )
+        result["model_id"] = entry_id
+        result["model_type"] = entry_type
+        return AnalyzeResponse(**result)
 
     # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
     raw_result = await run_in_threadpool(
         _score_upload, raw, canonical, keep_silence, audio.filename, entry_id,
     )
+    canonical_list = raw_result.get("canonical") or []
     speech_rate, speech_rate_ratio = _classify_speech_rate(
-        raw_result["canonical"], raw_result["duration_sec"]
+        canonical_list, raw_result["duration_sec"]
     )
-    return {
-        "perceived": raw_result["recognized"],
-        "canonical": raw_result["canonical"],
-        "peak_softmax": raw_result.get("peak_softmax", []),
-        "alignment": raw_result["alignment"],
-        "errors": raw_result["errors"],
-        "per": raw_result["per"],
-        "duration_sec": raw_result["duration_sec"],
-        "speech_rate": speech_rate,
-        "speech_rate_ratio": speech_rate_ratio,
-    }
+    return AnalyzeResponse(
+        perceived=raw_result["recognized"],
+        canonical=canonical_list,
+        peak_softmax=raw_result.get("peak_softmax", []),
+        alignment=raw_result["alignment"],
+        errors=raw_result["errors"],
+        per=raw_result["per"],
+        duration_sec=raw_result["duration_sec"],
+        speech_rate=speech_rate,
+        speech_rate_ratio=speech_rate_ratio,
+        model_id=entry_id,
+        model_type=entry_type,
+    )
 
 
-def _slplab_recognize(waveform: torch.Tensor) -> tuple[list[str], list[float]]:
-    """slplab 모델 추론 후 토큰 시퀀스와 토큰별 softmax peak 를 함께 돌려준다.
+def _slplab_recognize_with(model, processor, waveform: torch.Tensor) -> tuple[list[str], list[float]]:
+    """주어진 model/processor 로 slplab 추론 후 토큰 시퀀스와 토큰별 softmax peak 를 돌려준다.
 
     `batch_decode` 는 토큰 단위 confidence 를 노출하지 않으므로 frame-level argmax 를 직접
     duplicate/pad collapse 해 토큰 시퀀스와 같은 길이의 peak 배열을 만든다.
     """
-    model = state["slplab_model"]
-    proc = state["slplab_processor"]
-    if model is None or proc is None:
-        raise HTTPException(503, "slplab model not loaded")
     device = next(model.parameters()).device
-    inputs = proc(
+    inputs = processor(
         waveform.cpu().numpy(),
         sampling_rate=WAV2VEC2_SAMPLE_RATE,
         return_tensors="pt",
@@ -697,7 +915,7 @@ def _slplab_recognize(waveform: torch.Tensor) -> tuple[list[str], list[float]]:
     pred_ids = predicted_ids[0].tolist()
     pred_peaks = peaks_per_frame[0].tolist()
 
-    tokenizer = proc.tokenizer
+    tokenizer = processor.tokenizer
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -1
 
     tokens: list[str] = []
@@ -722,7 +940,7 @@ def _slplab_recognize(waveform: torch.Tensor) -> tuple[list[str], list[float]]:
     return tokens, peaks
 
 
-@app.post("/g2p")
+@app.post("/g2p", response_model=G2PResponse)
 async def g2p(text: str = Form(...)):
     """텍스트(단어 또는 문장) 를 모델 인벤토리에 맞춘 ARPAbet 음소 시퀀스로 변환한다.
 
@@ -736,10 +954,10 @@ async def g2p(text: str = Form(...)):
     if not text or not text.strip():
         raise HTTPException(400, "text is required")
     entries = converter.convert(text)
-    return {
-        "phonemes": " ".join(p for entry in entries for p in entry.phonemes),
-        "words": [{"word": entry.word, "phonemes": entry.phonemes} for entry in entries],
-    }
+    return G2PResponse(
+        phonemes=" ".join(p for entry in entries for p in entry.phonemes),
+        words=[G2PWord(word=entry.word, phonemes=entry.phonemes) for entry in entries],
+    )
 
 
 @app.post("/tts")

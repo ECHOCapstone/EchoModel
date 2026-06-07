@@ -107,6 +107,16 @@ class FiLMModel(nn.Module):
             film_embed_dim=config.film_embed_dim,
         )
 
+    def encoder_parameters(self):
+        """사전학습 음향 인코더 파라미터. Trainer 가 별도 LR 그룹으로 묶는다."""
+        return self.encoder.parameters()
+
+    def head_parameters(self):
+        """FiLM 생성기 + feature encoder + phoneme head 파라미터."""
+        yield from self.feature_encoder.parameters()
+        yield from self.film_gen.parameters()
+        yield from self.perceived_head.parameters()
+
     def forward(
         self,
         waveform,

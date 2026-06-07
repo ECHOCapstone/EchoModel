@@ -2,7 +2,9 @@
 
 import argparse
 import logging
-import sys
+import os
+
+import torch
 
 from echo.config import Config
 from echo.train import train_model
@@ -22,7 +24,6 @@ def parse_args():
                         help='FiLM phoneme embedding dim')
 
     # Data
-    parser.add_argument('--data_dir', type=str, default='data')
     parser.add_argument('--train_data', type=str, default='data/train.json')
     parser.add_argument('--val_data', type=str, default='data/val.json')
     parser.add_argument('--test_data', type=str, default='data/test.json')
@@ -54,6 +55,16 @@ def main():
     )
 
     args = parse_args()
+    # cpu 환경에서 num_workers 가 큰 값으로 들어오면 IPC 비용이 학습 step 보다 커진다.
+    # cuda 가 없을 때만 cpu_count 기준으로 줄여 OS 한도 초과를 막는다 (cuda 환경은 사용자가
+    # 명시 지정한 값을 그대로 신뢰).
+    if not torch.cuda.is_available() and args.num_workers > 0:
+        safe_workers = min(args.num_workers, max(1, (os.cpu_count() or 2) // 2))
+        if safe_workers != args.num_workers:
+            logging.getLogger(__name__).warning(
+                "CUDA unavailable; capping --num_workers from %d to %d.", args.num_workers, safe_workers,
+            )
+            args.num_workers = safe_workers
     setup_distributed()
     config = Config.from_args(args)
 

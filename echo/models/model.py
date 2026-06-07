@@ -48,6 +48,15 @@ class BaselineModel(nn.Module):
             mask_feature_length=config.mask_feature_length,
         )
 
+    def encoder_parameters(self):
+        """사전학습 음향 인코더(wav2vec2 등) 파라미터. Trainer 가 별도 LR 그룹으로 묶는다."""
+        return self.encoder.parameters()
+
+    def head_parameters(self):
+        """사전학습 인코더 이외(feature encoder + phoneme head) 파라미터."""
+        yield from self.feature_encoder.parameters()
+        yield from self.perceived_head.parameters()
+
     def forward(self, waveform, attention_mask=None, **kwargs):
         features = self.feature_encoder(self.encoder(waveform, attention_mask))
         return {'perceived_logits': self.perceived_head(features)}

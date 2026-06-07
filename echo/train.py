@@ -12,6 +12,28 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+logger = logging.getLogger(__name__)
+
+
+def _update_latest_symlink(experiment_dir: str) -> None:
+    """`experiments/<model>/<type>/latest` 가 항상 가장 최근 학습 디렉토리를 가리키도록 갱신한다.
+
+    registry / 평가 스크립트가 timestamp 디렉토리 대신 latest 를 참조하면 학습 후 경로 갱신을 잊어
+    레지스트리가 깨지는 케이스를 피할 수 있다. Windows 같이 심볼릭링크 권한이 없는 환경에서는
+    경고만 남기고 통과한다 — 학습 자체가 실패하면 안 된다.
+    """
+    parent = os.path.dirname(experiment_dir.rstrip("/"))
+    if not parent:
+        return
+    link_path = os.path.join(parent, "latest")
+    target = os.path.basename(experiment_dir.rstrip("/"))
+    try:
+        if os.path.islink(link_path) or os.path.exists(link_path):
+            os.remove(link_path)
+        os.symlink(target, link_path)
+    except OSError as exc:
+        logger.warning("latest symlink update failed (%s -> %s): %s", link_path, target, exc)
+
 from .config import Config
 from .data.dataset import PronunciationDataset, collate_batch
 from .evaluation.evaluator import ModelEvaluator
@@ -30,8 +52,6 @@ from .utils.distributed import (
     is_distributed, is_main_process, get_rank,
     get_local_rank, get_world_size, barrier, get_device, unwrap_model,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def set_random_seed(seed, deterministic=False):
@@ -170,4 +190,5 @@ def train_model(config: Config):
         os.makedirs(config.result_dir, exist_ok=True)
         with open(os.path.join(config.result_dir, 'final_metrics.json'), 'w') as f:
             json.dump(final, f, indent=2)
+        _update_latest_symlink(config.experiment_dir)
         logger.info(f"Training completed! Best: {best_metrics}")

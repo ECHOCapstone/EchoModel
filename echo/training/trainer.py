@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from ..constants import BLANK_TOKEN_ID
 from ..utils.audio import create_attention_mask, compute_output_lengths, enable_specaugment
 from ..utils.distributed import is_distributed, is_main_process, unwrap_model
 
@@ -22,19 +23,27 @@ class Trainer:
         self.config = config
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.logger = logger
-        self.ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
+        self.ctc_loss = nn.CTCLoss(blank=BLANK_TOKEN_ID, zero_infinity=True)
         self._setup_optimizers()
         self.scaler = torch.amp.GradScaler(self.device.type)
 
     def _setup_optimizers(self):
         raw = unwrap_model(self.model)
-        self.wav2vec_params = []
-        self.main_params = []
-        for name, param in raw.named_parameters():
-            if 'encoder.wav2vec2' in name:
-                self.wav2vec_params.append(param)
-            else:
-                self.main_params.append(param)
+        # 모델이 encoder_parameters / head_parameters 를 노출하면 사전학습 인코더 attribute 이름에
+        # 의존하지 않고 LR 그룹을 분리한다. 미노출이면 named_parameters 의 'encoder.' prefix 로 폴백.
+        if hasattr(raw, "encoder_parameters") and hasattr(raw, "head_parameters"):
+            self.wav2vec_params = [p for p in raw.encoder_parameters() if p.requires_grad]
+            self.main_params = [p for p in raw.head_parameters() if p.requires_grad]
+        else:
+            self.wav2vec_params = []
+            self.main_params = []
+            for name, param in raw.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name.startswith("encoder."):
+                    self.wav2vec_params.append(param)
+                else:
+                    self.main_params.append(param)
 
         self.wav2vec_optimizer = optim.AdamW(self.wav2vec_params, lr=self.config.wav2vec_lr)
         self.main_optimizer = optim.AdamW(self.main_params, lr=self.config.main_lr)

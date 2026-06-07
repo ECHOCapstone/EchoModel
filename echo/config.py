@@ -8,19 +8,26 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from .constants import MODEL_ALIASES
+from .constants import (
+    DEFAULT_PHONEME_MAP_PATH,
+    MODEL_ALIASES,
+    infer_num_phonemes,
+    load_phoneme_inventory,
+)
+from .utils.audio import WAV2VEC2_SAMPLE_RATE
 
 
 @dataclass
 class Config:
     # Pretrained model
     pretrained_model: str = "facebook/wav2vec2-base"
-    sampling_rate: int = 16000
+    sampling_rate: int = WAV2VEC2_SAMPLE_RATE
     max_length: int = 160000  # 10s at 16kHz
 
     # Model
     model_type: str = 'baseline'  # 'baseline' | 'film'
-    num_phonemes: int = 42
+    # phoneme_map 의 토큰 개수로 자동 계산된다. 명시 지정 시 그 값을 우선.
+    num_phonemes: Optional[int] = None
     hidden_dim: Optional[int] = None
     dropout: float = 0.1
 
@@ -56,11 +63,10 @@ class Config:
     device_id: Optional[int] = None
 
     # Data paths
-    data_dir: str = "data"
     train_data: str = "data/train.json"
     val_data: str = "data/val.json"
     test_data: str = "data/test.json"
-    phoneme_map: str = "data/phoneme_to_id.json"
+    phoneme_map: str = DEFAULT_PHONEME_MAP_PATH
 
     # Checkpoint
     save_best_metrics: List[str] = field(default_factory=lambda: ['mdd_f1'])
@@ -81,6 +87,8 @@ class Config:
                 self.hidden_dim = cfg.hidden_size
             except Exception:
                 self.hidden_dim = 768
+        if self.num_phonemes is None:
+            self.num_phonemes = infer_num_phonemes(load_phoneme_inventory(self.phoneme_map)[0])
         if not self.experiment_dir:
             self._setup_experiment_paths()
 
@@ -110,6 +118,4 @@ class Config:
             json.dump(self.to_dict(), f, indent=2)
 
     def load_phoneme_mappings(self) -> Tuple[Dict[str, int], Dict[int, str]]:
-        with open(self.phoneme_map, 'r') as f:
-            p2id = json.load(f)
-        return p2id, {v: k for k, v in p2id.items()}
+        return load_phoneme_inventory(self.phoneme_map)

@@ -7,12 +7,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .metrics import calculate_sequence_error_rate, calculate_mdd_metrics
-from ..constants import SILENCE_TOKENS
+from ..constants import BLANK_TOKEN_ID, SILENCE_TOKENS
 from ..utils.audio import compute_output_lengths, enable_specaugment, create_attention_mask
 from ..utils.distributed import is_main_process
 
 
-def frame_collapse_decode(logits, input_lengths, blank=0):
+def frame_collapse_decode(logits, input_lengths, blank: int = BLANK_TOKEN_ID):
     batch_size = logits.size(0)
     decoded = []
     for b in range(batch_size):
