@@ -1,20 +1,20 @@
-"""slplab L2-English 모델을 우리 test.json 으로 평가해 PER / MDD F1 을 측정한다.
+"""ECHO 모델 (자체 학습 wav2vec2 체크포인트) 을 test.json 으로 평가.
 
-ECHO 모델 평가(echo.evaluation.evaluator.ModelEvaluator) 와 같은 metric 함수
-(calculate_sequence_error_rate, calculate_mdd_metrics) 를 재사용하므로 점수는
-바로 비교 가능한 수치로 나온다.
+eval_slplab.py 와 같은 metric 함수 + 같은 출력 schema 를 쓴다. 따라서 두 결과 JSON 을 그대로
+diff / 표로 비교하면 모델별 PER · MDD F1 비교가 즉시 가능하다.
+
+ECHO 는 자체 음소 인벤토리 (`data/phoneme_to_id.json`) 외 토큰을 출력하지 않으므로 sanitize 가
+실제로는 무손실에 가깝지만, slplab 평가와 동일 파이프라인을 거치도록 sanitize 단계는 그대로 둔다.
 
 사용:
     cd /home/syh/workspace/ECHO_model
-    source venv/bin/activate    # 또는 본인 환경
-    python eval_slplab.py \\
+    source venv/bin/activate
+    python eval_echo.py \\
+        --checkpoint experiments/.../best_mdd_f1.pth \\
+        --phoneme-map data/phoneme_to_id.json \\
         --test-json data/test.json \\
-        --hf-id slplab/wav2vec2-large-robust-L2-english-phoneme-recognition \\
         --device cuda \\
-        --output analysis_output/slplab_evaluation.json
-
-출력:
-    JSON 한 건이 analysis_output/ 에 저장되고 콘솔에 요약 (PER / MDD F1) 이 찍힌다.
+        --output analysis_output/echo_evaluation.json
 """
 
 from __future__ import annotations
@@ -26,47 +26,17 @@ import time
 
 import soundfile as sf
 import torch
+import torchaudio
 from tqdm import tqdm
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from echo.constants import SILENCE_TOKENS
 from echo.evaluation.metrics import calculate_mdd_metrics, calculate_sequence_error_rate
+from echo.inference import PronunciationScorer
 from echo.utils.phoneme_sanitize import sanitize_perceived
 
 
-def load_audio(path: pathlib.Path, target_sr: int = 16000) -> torch.Tensor:
-    waveform, sr = sf.read(str(path), dtype="float32")
-    if waveform.ndim > 1:
-        waveform = waveform.mean(axis=1)
-    if sr != target_sr:
-        import torchaudio
-        waveform = torchaudio.functional.resample(
-            torch.from_numpy(waveform), sr, target_sr
-        ).numpy()
-    return torch.from_numpy(waveform)
-
-
-def recognize_raw(model, processor, waveform: torch.Tensor, device: str) -> list[str]:
-    """모델의 원본 출력 (`_err` / `b*` / `ax` 등 비표준 토큰 그대로).
-
-    공정 비교를 위해 PER 계산은 sanitize 후 inventory 기준 표준 음소로 수행한다 (main 에서 수행).
-    여기서는 모델이 실제로 무엇을 출력했는지 그대로 노출한다.
-    """
-    inputs = processor(
-        waveform.cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True
-    )
-    input_values = inputs.input_values.to(device)
-    with torch.no_grad():
-        logits = model(input_values).logits
-    predicted_ids = torch.argmax(logits, dim=-1)
-    text = processor.batch_decode(predicted_ids)[0].strip()
-    if not text:
-        return []
-    return text.split()
-
-
+# slplab 평가와 같은 인벤토리 로더 — 두 스크립트가 동일한 표준 음소 집합을 본다.
 def load_arpabet_inventory(phoneme_map_path: str) -> frozenset:
-    """phoneme_to_id.json 에서 silence / blank / 특수 토큰을 제외한 표준 음소 집합을 만든다."""
     with open(phoneme_map_path, "r", encoding="utf-8") as f:
         phoneme_map = json.load(f)
     return frozenset(
@@ -75,17 +45,26 @@ def load_arpabet_inventory(phoneme_map_path: str) -> frozenset:
     )
 
 
+def load_audio(path: pathlib.Path, target_sr: int) -> torch.Tensor:
+    waveform, sr = sf.read(str(path), dtype="float32")
+    if waveform.ndim > 1:
+        waveform = waveform.mean(axis=1)
+    if sr != target_sr:
+        waveform = torchaudio.functional.resample(
+            torch.from_numpy(waveform), sr, target_sr
+        ).numpy()
+    return torch.from_numpy(waveform)
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True,
+                        help="ECHO 학습 체크포인트 (.pth) 경로.")
+    parser.add_argument("--phoneme-map", default="data/phoneme_to_id.json")
     parser.add_argument("--test-json", default="data/test.json")
-    parser.add_argument("--data-root", default=".",
-                        help="test.json 의 wav 상대경로의 기준 디렉터리.")
-    parser.add_argument("--hf-id",
-                        default="slplab/wav2vec2-large-robust-L2-english-phoneme-recognition")
+    parser.add_argument("--data-root", default=".")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output", default="analysis_output/slplab_evaluation.json")
-    parser.add_argument("--phoneme-map", default="data/phoneme_to_id.json",
-                        help="표준 ARPABET 인벤토리 — sanitize 매핑의 기준이 된다.")
+    parser.add_argument("--output", default="analysis_output/echo_evaluation.json")
     parser.add_argument("--limit", type=int, default=None,
                         help="디버그용. 처음 N 개 발화만 평가.")
     args = parser.parse_args()
@@ -101,11 +80,13 @@ def main():
         items = items[: args.limit]
     print(f"평가 발화 수: {len(items)} (전체 {len(manifest)} 중 test split)")
 
-    print(f"모델 로드: {args.hf_id} → {args.device}")
-    processor = Wav2Vec2Processor.from_pretrained(args.hf_id)
-    model = Wav2Vec2ForCTC.from_pretrained(args.hf_id).to(args.device).eval()
+    print(f"체크포인트 로드: {args.checkpoint} → {args.device}")
+    scorer = PronunciationScorer.from_checkpoint(
+        checkpoint_path=args.checkpoint,
+        phoneme_map_path=args.phoneme_map,
+        device=args.device,
+    )
 
-    print(f"인벤토리 로드: {args.phoneme_map}")
     inventory = load_arpabet_inventory(args.phoneme_map)
     print(f"표준 음소 {len(inventory)} 개 — sanitize 후 PER 측정에 사용")
 
@@ -114,22 +95,20 @@ def main():
     errors_loading = 0
 
     start = time.time()
-    for uid, meta in tqdm(items, desc="slplab eval"):
+    for uid, meta in tqdm(items, desc="echo eval"):
         wav_rel = meta.get("wav")
         if not wav_rel:
             errors_loading += 1
             continue
         wav_path = data_root / wav_rel
         try:
-            waveform = load_audio(wav_path)
-            raw_tokens = recognize_raw(model, processor, waveform, args.device)
+            waveform = load_audio(wav_path, scorer.sampling_rate)
+            raw_tokens = scorer.transcribe(waveform, keep_silence=False)
         except Exception as exc:
             errors_loading += 1
             print(f"[skip] {uid}: {exc}")
             continue
 
-        # 인벤토리 기준 sanitize: _err / <pad> 드롭, b*/ax/eu/o → 가까운 ARPABET 매핑.
-        # raw vs sanitized 둘 다 PER 계산해 비표준 토큰이 PER 에 얼마나 영향을 주는지 분리해 보여 준다.
         sanitized = sanitize_perceived(raw_tokens, inventory)
 
         gt_aligned = meta["perceived_aligned"].split()
@@ -143,18 +122,16 @@ def main():
     elapsed = time.time() - start
     print(f"추론 완료: {elapsed/60:.1f} 분 (스킵 {errors_loading} 건)")
 
-    # ECHO evaluator 와 동일하게 silence 제거 후 PER 계산.
+    # eval_slplab.py 와 같은 파이프라인 — silence 제거 후 raw / sanitized 양쪽 PER 측정.
     raw_clean = [[p for p in s if p.lower() not in SILENCE_TOKENS] for s in all_pred_raw]
     pred_clean = [[p for p in s if p.lower() not in SILENCE_TOKENS] for s in all_pred_sanitized]
     gt_clean = [[p for p in s if p.lower() not in SILENCE_TOKENS] for s in all_gt]
 
-    # Raw PER — 비표준 토큰이 그대로 들어간 시퀀스. 모델 자체의 vocab 손실이 PER 에 그대로 반영된다.
     raw_details = calculate_sequence_error_rate(all_ids, gt_clean, raw_clean)
     raw_total_ph = sum(d["num_reference_tokens"] for d in raw_details)
     raw_total_err = sum(d["substitutions"] + d["deletions"] + d["insertions"] for d in raw_details)
     raw_per = raw_total_err / raw_total_ph if raw_total_ph > 0 else 0.0
 
-    # Sanitized PER — 비표준 토큰을 표준 ARPABET 로 매핑한 후의 시퀀스. 모델의 음향 인식 능력만 측정.
     per_details = calculate_sequence_error_rate(all_ids, gt_clean, pred_clean)
     total_ph = sum(d["num_reference_tokens"] for d in per_details)
     total_err = sum(d["substitutions"] + d["deletions"] + d["insertions"] for d in per_details)
@@ -175,12 +152,12 @@ def main():
         mdd_f1 = 0.0
 
     summary = {
-        "model": args.hf_id,
+        "model": "echo",
+        "checkpoint": str(args.checkpoint),
         "test_json": str(test_json),
         "num_utterances": len(items),
         "skipped": errors_loading,
         "elapsed_sec": elapsed,
-        # sanitized PER 가 공정 비교의 기준. raw PER 는 모델 vocab 차이가 PER 에 얼마나 영향을 주는지 보여 준다.
         "per": per,
         "raw_per": raw_per,
         "total_phonemes": total_ph,
@@ -196,7 +173,7 @@ def main():
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print("=" * 50)
-    print(f"PER (raw)       : {raw_per:.4f}  ← 비표준 토큰 그대로 포함 (참고)")
+    print(f"PER (raw)       : {raw_per:.4f}")
     print(f"PER (sanitized) : {per:.4f}  ← 공정 비교 기준")
     print(f"MDD F1          : {mdd_f1:.4f}")
     print(f"저장됨          : {output_path}")
