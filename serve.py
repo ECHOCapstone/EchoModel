@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import gc
 import io
 import json
 import logging
 import os
 import pathlib
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -47,10 +49,12 @@ from fastapi.staticfiles import StaticFiles
 
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+from echo.constants import SILENCE_TOKENS
 from echo.evaluation.metrics import get_alignment_with_indices
 from echo.inference import PronunciationScorer
 from echo.utils.audio import WAV2VEC2_SAMPLE_RATE
 from echo.utils.g2p import G2P
+from echo.utils.phoneme_sanitize import sanitize_perceived
 
 logger = logging.getLogger("echo.serve")
 
@@ -90,6 +94,8 @@ except Exception:
 
 # lifespan 동안 유지되는 추론기/G2P 핸들과 부팅 설정.
 # registry: {"models": [entry...], "default": id}, active_model_id: 현재 메모리에 올라온 모델 id.
+# arpabet_inventory: phoneme_to_id.json 에서 추출한 표준 음소 집합 — sanitize 가 인벤토리 외
+# 토큰만 매핑/드롭하도록 한다.
 state: dict = {
     "scorer": None,
     "g2p": None,
@@ -98,7 +104,14 @@ state: dict = {
     "config": {},
     "registry": {"models": [], "default": None},
     "active_model_id": None,
+    "arpabet_inventory": frozenset(),
 }
+
+
+# 모델 교체와 추론을 직렬화하는 락. 모델 A 추론 도중 다른 요청이 _unload_current 를 호출해
+# GPU 텐서가 GC 되거나 두 모델이 동시에 GPU 로 올라가 OOM 이 발생하는 race 를 차단한다.
+# RLock 이라 같은 스레드에서 ensure_loaded 와 추론을 중첩으로 잡아도 안전하다.
+_MODEL_SWITCH_LOCK = threading.RLock()
 
 
 def _load_registry(cfg: dict) -> dict:
@@ -136,11 +149,17 @@ def _entry_by_id(model_id: Optional[str]) -> Optional[dict]:
 
 
 def _unload_current() -> None:
-    """현재 로드된 인식 모델을 내려 GPU/RAM 을 회수한다 (G2P 는 모델과 무관하므로 유지)."""
+    """현재 로드된 인식 모델을 내려 GPU/RAM 을 회수한다 (G2P 는 모델과 무관하므로 유지).
+
+    호출자는 반드시 `_MODEL_SWITCH_LOCK` 을 잡은 상태여야 한다 — 추론 중인 다른 요청과의
+    race 를 막기 위한 전제다.
+    """
     state["scorer"] = None
     state["slplab_model"] = None
     state["slplab_processor"] = None
     state["active_model_id"] = None
+    # 파이썬 GC 를 한 번 돌려 모델이 참조하던 텐서가 즉시 해제되도록 한다. 그 후 CUDA 캐시 회수.
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -167,37 +186,62 @@ def _load_model(entry: dict) -> None:
 
 def ensure_loaded(model_id: Optional[str]) -> dict:
     """요청한 모델을 보장 로드한다. 이미 활성이면 그대로, 다르면 기존 것을 내리고 교체 로드한다.
-    model_id 가 None 이면 활성 모델, 그것도 없으면 레지스트리 기본 모델을 쓴다. 활성 entry 를 반환."""
-    target_id = model_id or state["active_model_id"] or state["registry"].get("default")
-    entry = _entry_by_id(target_id)
-    if entry is None:
-        raise HTTPException(400, f"unknown model: {target_id}")
-    if state["active_model_id"] != entry["id"]:
-        logger.info("Switching recognition model: %s -> %s", state["active_model_id"], entry["id"])
-        _unload_current()
-        _load_model(entry)
-    return entry
+
+    model_id 가 None 이면 활성 모델, 그것도 없으면 레지스트리 기본 모델을 쓴다. 활성 entry 를 반환.
+    동시에 들어온 두 요청이 서로 다른 모델을 부르거나 한 요청이 추론 중인데 다른 요청이 교체를
+    시도하는 race 를 막기 위해 `_MODEL_SWITCH_LOCK` 안에서만 상태를 갱신한다.
+    """
+    with _MODEL_SWITCH_LOCK:
+        target_id = model_id or state["active_model_id"] or state["registry"].get("default")
+        entry = _entry_by_id(target_id)
+        if entry is None:
+            raise HTTPException(400, f"unknown model: {target_id}")
+        if state["active_model_id"] != entry["id"]:
+            logger.info("Switching recognition model: %s -> %s", state["active_model_id"], entry["id"])
+            _unload_current()
+            _load_model(entry)
+        return entry
 
 
 # 디버그용 dump 디렉토리. 환경변수 ECHO_DUMP_DIR 가 설정되어 있을 때만 활성화.
 # 활성화되면 매 요청마다 raw upload 와 denoise+VAD 적용 후 신호를 함께 떨어뜨려 비교 청취 가능.
 _DUMP_DIR = os.environ.get("ECHO_DUMP_DIR")
+# dump 디렉토리에 남길 최대 파일 개수. 환경변수 ECHO_DUMP_KEEP 으로 조정 가능 (기본 200).
+# 초과 시 오래된 파일부터 삭제 — 무한 누적으로 디스크가 포화되는 것을 막는다.
+_DUMP_KEEP = int(os.environ.get("ECHO_DUMP_KEEP", "200"))
+
+
+def _prune_dump_dir(out_dir: pathlib.Path) -> None:
+    """덤프 디렉토리의 파일 수가 _DUMP_KEEP 을 넘으면 오래된 것부터 삭제한다."""
+    try:
+        files = sorted(out_dir.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        excess = len(files) - _DUMP_KEEP
+        for stale in files[: max(0, excess)]:
+            stale.unlink(missing_ok=True)
+    except OSError as e:
+        # 파일 정리는 best-effort — 실패해도 추론은 그대로 계속.
+        logger.warning("Audio dump prune failed (ignored): %s", e)
 
 
 def _dump_audio(raw: bytes, processed: torch.Tensor, sr: int, filename: Optional[str]) -> None:
-    """원본 업로드 바이트와 전처리 후 텐서를 디스크에 함께 저장한다 (ECHO_DUMP_DIR 설정 시만)."""
+    """원본 업로드 바이트와 전처리 후 텐서를 디스크에 함께 저장한다 (ECHO_DUMP_DIR 설정 시만).
+
+    저장 후 디렉토리 파일 수가 한도(_DUMP_KEEP)를 넘으면 오래된 파일부터 정리해 누적을 막는다.
+    파일명은 PurePath.stem 으로 정규화해 경로 분리자가 포함된 입력에도 안전하다.
+    """
     if not _DUMP_DIR:
         return
     try:
         out_dir = pathlib.Path(_DUMP_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        stem = (filename or "rec").rsplit(".", 1)[0].replace("/", "_").replace("\\", "_")
+        stem = pathlib.PurePath(filename or "rec").stem.replace("/", "_").replace("\\", "_") or "rec"
         raw_path = out_dir / f"{ts}_{stem}_raw.wav"
         proc_path = out_dir / f"{ts}_{stem}_processed.wav"
         raw_path.write_bytes(raw)
         sf.write(str(proc_path), processed.cpu().numpy(), sr)
         logger.info("Dumped audio: %s, %s", raw_path.name, proc_path.name)
+        _prune_dump_dir(out_dir)
     except Exception as e:
         logger.warning("Audio dump failed (ignored): %s", e)
 
@@ -259,12 +303,17 @@ def _denoise(wav: torch.Tensor, sr: int) -> torch.Tensor:
 
 
 def _trim_silence(wav: torch.Tensor, sr: int) -> torch.Tensor:
-    """앞뒤 무음을 RMS 기반 VAD 로 제거. 중간 무음은 보존한다 (발음 사이 자연스러운 호흡)."""
+    """앞뒤 무음을 RMS 기반 VAD 로 제거. 중간 무음은 보존한다 (발음 사이 자연스러운 호흡).
+
+    peak 가 _VAD_ABS_FLOOR 미만이면 트림하지 않는다 — 노트북 내장 마이크처럼 게인이 낮으면
+    음성과 잡음의 peak 차이가 거의 없어, peak 기준 dBFS 임계가 발화를 통째로 잘라낼 수 있다.
+    이 경우는 보수적으로 원본을 모델에 맡긴다 (잘못된 트림보다 안전).
+    """
     if wav.numel() == 0:
         return wav
     peak = wav.abs().max().item()
     if peak < _VAD_ABS_FLOOR:
-        return wav  # 전체가 너무 작다 → 트림하지 않고 그대로 (모델이 판단)
+        return wav
 
     frame_len = max(1, int(sr * _VAD_FRAME_MS / 1000))
     hop_len = max(1, int(sr * _VAD_HOP_MS / 1000))
@@ -278,8 +327,10 @@ def _trim_silence(wav: torch.Tensor, sr: int) -> torch.Tensor:
     db = 20.0 * torch.log10(rms / peak)
     voiced = db > _VAD_DB_THRESH
 
-    if not voiced.any():
-        return wav  # 모두 무음 판정 → 그대로 보낸다 (잘못된 트림보다 안전)
+    # 모두 무음 판정이거나 voiced 프레임이 전체의 5% 미만이면 신뢰할 수 없는 트림 — 원본을 그대로 보낸다.
+    # 보수적인 안전망: 발화 자체가 통째로 잘리는 worst case 를 막는다.
+    if not voiced.any() or voiced.sum().item() < max(2, int(0.05 * frames.shape[0])):
+        return wav
 
     first = int(voiced.nonzero()[0].item())
     last = int(voiced.nonzero()[-1].item())
@@ -321,22 +372,39 @@ async def lifespan(app: FastAPI):
 
     # G2P 는 인식 모델과 무관하게 독립 동작 — phoneme_map 만 있으면 로드한다.
     # 백엔드가 /g2p 로 canonical 시퀀스를 만들어 /analyze 에 보내므로 항상 필요하다.
+    # 같은 파일을 sanitize 의 인벤토리로도 활용한다 (인벤토리 = blank/silence/<...> 제외한 표준 음소).
     pmap = cfg.get("phoneme_map", "")
     if pmap and pmap.lower() != "none" and os.path.isfile(pmap):
         state["g2p"] = G2P.from_phoneme_map(pmap)
-        logger.info("G2P ready (phoneme_map=%s)", pmap)
+        with open(pmap, "r", encoding="utf-8") as f:
+            phoneme_map_data = json.load(f)
+        state["arpabet_inventory"] = frozenset(
+            k.lower() for k in phoneme_map_data.keys()
+            if not k.startswith("<") and k.lower() not in SILENCE_TOKENS
+        )
+        logger.info(
+            "G2P ready (phoneme_map=%s, inventory=%d phonemes)",
+            pmap, len(state["arpabet_inventory"]),
+        )
 
     # 모델 레지스트리를 읽고 기본 모델을 메모리에 올린다. 이후 /analyze?model=<id> 로 교체된다.
+    # 기본 모델 로드 실패가 서버 부팅 자체를 막지 않게 한다 — /g2p / /tts 는 계속 동작하고
+    # /analyze 만 active_model_id 가 None 인 상태로 503 을 돌려준다.
     state["registry"] = _load_registry(cfg)
     default_id = state["registry"].get("default")
     if default_id:
-        ensure_loaded(default_id)
+        try:
+            ensure_loaded(default_id)
+        except Exception as exc:
+            logger.error("Failed to load default model '%s': %s", default_id, exc)
     else:
         logger.warning("No recognition model in registry — /analyze will return 503")
 
     yield
-    _unload_current()
+    with _MODEL_SWITCH_LOCK:
+        _unload_current()
     state["g2p"] = None
+    state["arpabet_inventory"] = frozenset()
 
 
 app = FastAPI(title="ECHO Pronunciation Server", lifespan=lifespan)
@@ -402,22 +470,27 @@ def _score_upload(
     canonical: Optional[str],
     keep_silence: bool,
     filename: Optional[str],
+    expected_model_id: Optional[str] = None,
 ) -> dict:
-    # 모델 호출의 공통 처리 - 디코딩, 길이 검증, score 호출, 메타 추가.
-    scorer = state["scorer"]
-    if scorer is None:
-        raise HTTPException(503, "Scorer not ready")
+    """ECHO 추론기로 발음 평가. 디코딩 → 모델 호출 → 메타 부착의 공통 처리."""
     if not raw:
         raise HTTPException(400, "Empty audio upload")
-    waveform = _decode_upload(raw, scorer.sampling_rate)
-    if waveform.numel() == 0:
-        raise HTTPException(400, "Decoded audio is empty")
-    _dump_audio(raw, waveform, scorer.sampling_rate, filename)
+    # 추론 전 모델 교체 race 를 막기 위해 lock 안에서 모델 참조를 캡처하고 추론까지 마친다.
+    with _MODEL_SWITCH_LOCK:
+        if expected_model_id and state["active_model_id"] != expected_model_id:
+            ensure_loaded(expected_model_id)
+        scorer = state["scorer"]
+        if scorer is None:
+            raise HTTPException(503, "Scorer not ready")
+        waveform = _decode_upload(raw, scorer.sampling_rate)
+        if waveform.numel() == 0:
+            raise HTTPException(400, "Decoded audio is empty")
+        _dump_audio(raw, waveform, scorer.sampling_rate, filename)
 
-    result = scorer.score(waveform, canonical=canonical, keep_silence=keep_silence)
-    result["filename"] = filename
-    result["duration_sec"] = float(waveform.shape[0] / scorer.sampling_rate)
-    return result
+        result = scorer.score(waveform, canonical=canonical, keep_silence=keep_silence)
+        result["filename"] = filename
+        result["duration_sec"] = float(waveform.shape[0] / scorer.sampling_rate)
+        return result
 
 
 # 업로드를 최대 크기까지만 읽어 메모리 고갈을 막는다. 한도를 넘으면 413 으로 거절한다.
@@ -434,17 +507,23 @@ async def score(
     canonical: Optional[str] = Form(None),
     keep_silence: bool = Form(False),
 ):
-    """기존 호환 응답: recognized 키 + peak_softmax 포함."""
+    """기존 호환 응답: recognized 키 + peak_softmax 포함. 모델 선택은 활성 모델을 그대로 따른다."""
     raw = await _read_limited(audio)
-    # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
-    return await run_in_threadpool(_score_upload, raw, canonical, keep_silence, audio.filename)
+    # 활성 모델 그대로 사용 — expected_model_id 를 비워두면 추론 함수가 현재 active_model 만 검증한다.
+    return await run_in_threadpool(
+        _score_upload, raw, canonical, keep_silence, audio.filename, state["active_model_id"],
+    )
 
 
-# 영어 평균 발화 속도 (음소/초). 사용자 데이터에서 fine-tune 가능.
-# 이 값을 기준으로 expected_sec 을 계산하고 실제 duration 과 비율로 fast/normal/slow 를 분기한다.
-_PHONEMES_PER_SECOND_NORMAL = 14.0
-_FAST_RATIO_THRESHOLD = 0.6   # 실제 / 예상 < 0.6 이면 빠른 발화
-_SLOW_RATIO_THRESHOLD = 1.6   # 실제 / 예상 > 1.6 이면 느린 발화
+# 발화 속도 분류 기준. 학습자 데이터를 토대로 다음과 같이 보정한다.
+#   - normal phonemes/sec: 원어민 빠른 발화는 14 음소/초 수준이나, 한국인 L2 학습자는
+#     보통 8~12 음소/초 영역에서 발화하므로 10.0 을 기준으로 둔다. 이 값을 낮추면 한국인
+#     사용자가 정상 발화에 가까울수록 ratio 가 1.0 에 가까워져 잘못된 "느림" 분류가 줄어든다.
+#   - fast/slow threshold: 정상 윈도우를 더 넉넉히 잡아 평소 페이스의 학습자가 매번 fast/slow 로
+#     분류되는 것을 막는다 (0.55~1.8).
+_PHONEMES_PER_SECOND_NORMAL = 10.0
+_FAST_RATIO_THRESHOLD = 0.55
+_SLOW_RATIO_THRESHOLD = 1.8
 
 
 def _classify_speech_rate(canonical_phonemes: list, duration_sec: float) -> tuple[str, float]:
@@ -481,19 +560,50 @@ def _build_alignment(canonical_list: list[str], perceived_list: list[str]) -> di
     return {"alignment": alignment, "errors": errors, "per": per}
 
 
-def _analyze_with_slplab(raw: bytes, canonical: Optional[str], filename: Optional[str]) -> dict:
-    """slplab 모델로 인식 후 기존 /analyze 와 동일한 응답 형식을 만든다."""
-    scorer = state["scorer"]
-    sr = scorer.sampling_rate if scorer else WAV2VEC2_SAMPLE_RATE
+def _analyze_with_slplab(
+    raw: bytes,
+    canonical: Optional[str],
+    keep_silence: bool,
+    filename: Optional[str],
+    expected_model_id: Optional[str] = None,
+) -> dict:
+    """slplab 모델로 인식 후 ECHO 모델 응답과 동일한 형식으로 정렬·메타까지 묶어 돌려준다.
+
+    sanitize 단계가 vocab 잡음을 흡수하므로 학습자에게 표준 ARPABET 시퀀스만 노출된다.
+    keep_silence 가 False 면 silence 토큰을 제거해 ECHO 경로와 정합한 채점 결과를 만든다.
+    """
     if not raw:
         raise HTTPException(400, "Empty audio upload")
-    waveform = _decode_upload(raw, sr)
-    if waveform.numel() == 0:
-        raise HTTPException(400, "Decoded audio is empty")
-    _dump_audio(raw, waveform, sr, filename)
+    # slplab vocab 은 16kHz 고정이라 ECHO scorer 의 sampling_rate 가 아닌 상수를 사용한다.
+    sr = WAV2VEC2_SAMPLE_RATE
+    with _MODEL_SWITCH_LOCK:
+        if expected_model_id and state["active_model_id"] != expected_model_id:
+            ensure_loaded(expected_model_id)
+        if state["slplab_model"] is None or state["slplab_processor"] is None:
+            raise HTTPException(503, "slplab model not loaded")
+        waveform = _decode_upload(raw, sr)
+        if waveform.numel() == 0:
+            raise HTTPException(400, "Decoded audio is empty")
+        _dump_audio(raw, waveform, sr, filename)
 
-    perceived_raw = _slplab_recognize(waveform)
-    perceived = [p.replace("_err", "") for p in perceived_raw]
+        raw_tokens, raw_peaks = _slplab_recognize(waveform)
+
+    # vocab 잡음 정리는 락 밖에서 — 모델 자원을 더 이상 만지지 않는다.
+    inventory = state["arpabet_inventory"]
+    sanitized: list[str] = []
+    sanitized_peaks: list[float] = []
+    for token, peak in zip(raw_tokens, raw_peaks):
+        for clean_token in sanitize_perceived([token], inventory):
+            sanitized.append(clean_token)
+            sanitized_peaks.append(peak)
+
+    if keep_silence:
+        perceived = sanitized
+        peak_softmax = sanitized_peaks
+    else:
+        kept = [(p, pk) for p, pk in zip(sanitized, sanitized_peaks) if p not in SILENCE_TOKENS]
+        perceived = [p for p, _ in kept]
+        peak_softmax = [pk for _, pk in kept]
 
     canonical_list: list[str] = []
     if canonical and canonical.strip():
@@ -508,7 +618,7 @@ def _analyze_with_slplab(raw: bytes, canonical: Optional[str], filename: Optiona
     return {
         "perceived": perceived,
         "canonical": canonical_list,
-        "peak_softmax": [],
+        "peak_softmax": peak_softmax,
         "alignment": diag["alignment"],
         "errors": diag["errors"],
         "per": diag["per"],
@@ -532,12 +642,19 @@ async def analyze(
     """
     raw = await _read_limited(audio)
     entry = ensure_loaded(model)
+    entry_id = entry["id"]
 
+    # 추론 함수는 자체 락 안에서 active_model_id 가 expected 와 다르면 다시 ensure_loaded 를
+    # 부르므로, ensure_loaded 와 추론 사이에 다른 요청이 모델을 바꿔도 안전하다.
     if entry.get("type") == "slplab":
-        return await run_in_threadpool(_analyze_with_slplab, raw, canonical, audio.filename)
+        return await run_in_threadpool(
+            _analyze_with_slplab, raw, canonical, keep_silence, audio.filename, entry_id,
+        )
 
     # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
-    raw_result = await run_in_threadpool(_score_upload, raw, canonical, keep_silence, audio.filename)
+    raw_result = await run_in_threadpool(
+        _score_upload, raw, canonical, keep_silence, audio.filename, entry_id,
+    )
     speech_rate, speech_rate_ratio = _classify_speech_rate(
         raw_result["canonical"], raw_result["duration_sec"]
     )
@@ -554,20 +671,55 @@ async def analyze(
     }
 
 
-def _slplab_recognize(waveform: torch.Tensor) -> list[str]:
-    """slplab 모델로 음소 시퀀스 인식. _err 태그 포함 그대로 반환한다."""
+def _slplab_recognize(waveform: torch.Tensor) -> tuple[list[str], list[float]]:
+    """slplab 모델 추론 후 토큰 시퀀스와 토큰별 softmax peak 를 함께 돌려준다.
+
+    `batch_decode` 는 토큰 단위 confidence 를 노출하지 않으므로 frame-level argmax 를 직접
+    duplicate/pad collapse 해 토큰 시퀀스와 같은 길이의 peak 배열을 만든다.
+    """
     model = state["slplab_model"]
     proc = state["slplab_processor"]
     if model is None or proc is None:
         raise HTTPException(503, "slplab model not loaded")
     device = next(model.parameters()).device
-    inputs = proc(waveform.cpu().numpy(), sampling_rate=WAV2VEC2_SAMPLE_RATE, return_tensors="pt", padding=True)
+    inputs = proc(
+        waveform.cpu().numpy(),
+        sampling_rate=WAV2VEC2_SAMPLE_RATE,
+        return_tensors="pt",
+        padding=True,
+    )
     input_values = inputs.input_values.to(device)
     with torch.no_grad():
-        logits = model(input_values).logits
-    predicted_ids = torch.argmax(logits, dim=-1)
-    raw_text = proc.batch_decode(predicted_ids)[0]
-    return raw_text.strip().split() if raw_text.strip() else []
+        logits = model(input_values).logits  # [B, T, V]
+
+    probs = logits.softmax(dim=-1)
+    peaks_per_frame, predicted_ids = probs.max(dim=-1)
+    pred_ids = predicted_ids[0].tolist()
+    pred_peaks = peaks_per_frame[0].tolist()
+
+    tokenizer = proc.tokenizer
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -1
+
+    tokens: list[str] = []
+    peaks: list[float] = []
+    prev = -1
+    for tid, pk in zip(pred_ids, pred_peaks):
+        if tid == pad_id:
+            prev = tid
+            continue
+        if tid == prev:
+            # 같은 라벨이 연속하는 프레임 묶음의 confidence 는 최댓값으로 갱신.
+            if peaks and pk > peaks[-1]:
+                peaks[-1] = float(pk)
+            continue
+        token_text = tokenizer.convert_ids_to_tokens(tid)
+        if not token_text:
+            prev = tid
+            continue
+        tokens.append(token_text)
+        peaks.append(float(pk))
+        prev = tid
+    return tokens, peaks
 
 
 @app.post("/g2p")
@@ -609,7 +761,9 @@ async def tts(text: str = Form(...), lang: str = Form("en")):
     try:
         buf = await run_in_threadpool(_synthesize)
     except Exception as e:
-        raise HTTPException(500, f"TTS failed: {e}")
+        # gTTS 는 외부 Google 서버에 의존하므로 네트워크 단절 / 쿼터 초과는 자체 장애가 아닌
+        # 업스트림 가용성 문제다. 5xx 가 아닌 503 으로 분리해 호출 측이 재시도 정책을 정확히 세울 수 있게 한다.
+        raise HTTPException(503, f"TTS upstream failed: {e}")
     return StreamingResponse(buf, media_type="audio/mpeg")
 
 
