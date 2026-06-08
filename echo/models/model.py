@@ -13,6 +13,9 @@ from .heads import PhonemeHead
 class BaselineModel(nn.Module):
     """Perceived-only baseline: Wav2Vec2 + CTC phoneme head."""
 
+    # 추론 시 canonical 음소열을 입력으로 요구하는지 여부. baseline 은 음성만으로 인식하므로 False.
+    requires_canonical: bool = False
+
     def __init__(
         self,
         pretrained_model_name: str = "facebook/wav2vec2-base",
