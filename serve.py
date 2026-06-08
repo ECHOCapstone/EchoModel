@@ -14,11 +14,12 @@ Run:
     요청 시 교체 로드되므로 한 번에 하나만 메모리에 올라간다. 후보는 GET /models 로 조회.
 
 Endpoints:
-    GET  /healthz     서버/모델/TTS 가용 상태 (active_model 포함)
+    GET  /healthz     서버/모델/TTS/G2p 가용 상태 (active_model 포함)
     GET  /models      선택 가능한 음소인식 모델 후보 + 활성 모델
     GET  /phonemes    학습된 음소 리스트
     POST /transcribe  음소 인식 - perceived/peak_softmax + 발화 속도 분류
     POST /score       (deprecated) 기존 호환 - recognized 키 사용. 백엔드 호출처가 정리되면 제거 예정.
+    POST /g2p         텍스트 → 단어별 baseline ARPABET (CMU + g2p_en, LLM refine 의 입력)
     POST /tts         텍스트 → mp3 음성 (gTTS)
     GET  /            데모 웹 UI
 """
@@ -53,6 +54,7 @@ from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 from echo.constants import DEFAULT_PHONEME_MAP_PATH, SILENCE_TOKENS
 from echo.inference import PronunciationScorer
 from echo.utils.audio import WAV2VEC2_SAMPLE_RATE
+from echo.utils.g2p import G2p as G2pConverter
 from echo.utils.phoneme_sanitize import sanitize_perceived
 
 logger = logging.getLogger("echo.serve")
@@ -103,6 +105,8 @@ state: dict = {
     "registry": {"models": [], "default": None},
     "active_model_id": None,
     "arpabet_inventory": frozenset(),
+    # CMU 기반 결정적 baseline canonical 생성기 (g2p_en wrapper). 부팅 시 1회 init.
+    "g2p": None,
     # checkpoint sha256 fingerprint 캐시 (lazy). 같은 파일을 매번 다시 해시하지 않게.
     "fingerprints": {},
     # in-flight 추론 수. swap 이 새 모델 로드 직전 0 까지 대기하는 게이트로 쓰인다.
@@ -170,10 +174,26 @@ class HealthzResponse(BaseModel):
     num_phonemes: Optional[int] = None
     tts_available: bool
     slplab_loaded: bool
+    g2p_ready: bool
 
 
 class PhonemesResponse(BaseModel):
     phonemes: List[str]
+
+
+# /g2p baseline canonical 생성기 contract. 백엔드 LLM 이 단어별 ARPABET 시퀀스를 받아
+# 문맥 의존 발음(예: the+vowel) 을 refine 한다.
+class G2pRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+
+
+class G2pWord(BaseModel):
+    word: str
+    phonemes: List[str]
+
+
+class G2pResponse(BaseModel):
+    words: List[G2pWord]
 
 
 def _load_registry(cfg: dict) -> dict:
@@ -578,10 +598,20 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No recognition model in registry — /transcribe will return 503")
 
+    # baseline canonical 생성기. g2p_en 의 NLTK/LSTM 로드 비용이 부팅에 한 번만 들도록 init.
+    # 실패해도 인식/TTS 는 그대로 동작하고 /g2p 만 503 으로 거절한다.
+    try:
+        state["g2p"] = G2pConverter(inventory=state["arpabet_inventory"])
+        logger.info("G2p ready (inventory=%d phonemes)", len(state["arpabet_inventory"]))
+    except Exception as exc:
+        logger.error("Failed to init G2p: %s", exc)
+        state["g2p"] = None
+
     yield
     with _MODEL_SWITCH_LOCK:
         _unload_current()
     state["arpabet_inventory"] = frozenset()
+    state["g2p"] = None
 
 
 app = FastAPI(title="ECHO Pronunciation Server", lifespan=lifespan)
@@ -623,6 +653,7 @@ def healthz():
         num_phonemes=len(scorer.phoneme_to_id) if scorer else None,
         tts_available=_TTS_AVAILABLE,
         slplab_loaded=state["slplab_model"] is not None,
+        g2p_ready=state["g2p"] is not None,
     )
 
 
@@ -880,6 +911,28 @@ def _slplab_recognize_with(model, processor, waveform: torch.Tensor) -> tuple[li
         peaks.append(float(pk))
         prev = tid
     return tokens, peaks
+
+
+@app.post("/g2p", response_model=G2pResponse)
+async def g2p(req: G2pRequest):
+    """CMU 기반 결정적 baseline canonical 생성.
+
+    입력 텍스트를 g2p_en 으로 단어별 ARPABET (UPPERCASE) 시퀀스로 변환해 돌려준다.
+    문맥 의존 발음(예: the+vowel → DH IY) 같은 정교한 후처리는 백엔드 LLM 의 책임.
+    body 는 `{"text": "..."}`, 응답은 `{"words": [{"word", "phonemes"}, ...]}`.
+    """
+    converter: Optional[G2pConverter] = state["g2p"]
+    if converter is None:
+        raise HTTPException(503, "G2p not ready")
+    # g2p_en 의 LSTM 예측은 CPU 블로킹 호출이라 스레드풀로 보낸다.
+    try:
+        words = await run_in_threadpool(converter.convert, req.text)
+    except Exception as exc:
+        logger.exception("G2p conversion failed")
+        raise HTTPException(500, f"G2p conversion failed: {exc}")
+    return G2pResponse(
+        words=[G2pWord(word=w.word, phonemes=w.phonemes) for w in words],
+    )
 
 
 @app.post("/tts")

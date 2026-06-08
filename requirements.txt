@@ -17,3 +17,5 @@ gTTS==2.5.4
 transformers==5.5.3
 # 학습/평가 진행률 출력 및 dataset 빌드 로그.
 tqdm==4.67.3
+# /g2p baseline canonical 생성기 (CMU dict + LSTM OOV fallback).
+g2p-en==2.1.0
