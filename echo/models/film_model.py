@@ -69,6 +69,10 @@ class FiLMGen(nn.Module):
 class FiLMModel(nn.Module):
     """Wav2Vec2 + global FiLM conditioning on canonical phonemes."""
 
+    # 추론 시 canonical 음소열을 입력으로 요구하는지 여부. FiLM 변조가 canonical 에 조건화되므로,
+    # canonical 없이 추론하면 학습 분포와 어긋나 성능이 붕괴한다 → True.
+    requires_canonical: bool = True
+
     def __init__(
         self,
         pretrained_model_name: str = "facebook/wav2vec2-base",

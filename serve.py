@@ -158,6 +158,9 @@ class ModelEntry(BaseModel):
     type: Optional[str] = None
     # checkpoint sha256 (lazy fingerprint). slplab 같이 hf_id 만 있는 모델은 None.
     sha256: Optional[str] = None
+    # 추론에 canonical 음소열이 필요한지. slplab 은 항상 False, 활성 echo 모델은 로드된
+    # 아키텍처에서 판정, 비활성 echo 모델은 로드 전이라 알 수 없어 None.
+    requires_canonical: Optional[bool] = None
 
 
 class ModelsResponse(BaseModel):
@@ -172,6 +175,8 @@ class HealthzResponse(BaseModel):
     active_type: Optional[str] = None
     device: Optional[str] = None
     num_phonemes: Optional[int] = None
+    # 활성 모델이 추론에 canonical 음소열을 요구하는지. 활성 모델이 없으면 None.
+    requires_canonical: Optional[bool] = None
     tts_available: bool
     slplab_loaded: bool
     g2p_ready: bool
@@ -227,6 +232,24 @@ def _entry_by_id(model_id: Optional[str]) -> Optional[dict]:
     for m in state["registry"].get("models", []):
         if m.get("id") == model_id:
             return m
+    return None
+
+
+def _entry_requires_canonical(entry: Optional[dict]) -> Optional[bool]:
+    """레지스트리 entry 가 추론에 canonical 음소열을 요구하는지.
+
+    slplab 은 canonical 입력이 없는 외부 CTC 모델이라 로드 여부와 무관하게 항상 False.
+    echo 모델은 아키텍처(baseline/film)에 따라 갈리며 그 정보는 로드된 모델만 알 수 있으므로,
+    활성 모델일 때만 스코어러에서 판정하고 비활성 echo 모델은 None(미상)을 돌려준다.
+    """
+    if entry is None:
+        return None
+    if entry.get("type") == "slplab":
+        return False
+    if entry.get("id") == state["active_model_id"]:
+        scorer = state.get("scorer")
+        if scorer is not None:
+            return scorer.requires_canonical
     return None
 
 
@@ -641,16 +664,15 @@ def index():
 def healthz():
     scorer = state["scorer"]
     active_id = state["active_model_id"]
-    active_type = None
-    if active_id:
-        entry = _entry_by_id(active_id)
-        active_type = entry.get("type") if entry else None
+    active_entry = _entry_by_id(active_id) if active_id else None
+    active_type = active_entry.get("type") if active_entry else None
     return HealthzResponse(
         ok=scorer is not None or state["slplab_model"] is not None,
         active_model_id=active_id,
         active_type=active_type,
         device=str(scorer.device) if scorer else None,
         num_phonemes=len(scorer.phoneme_to_id) if scorer else None,
+        requires_canonical=_entry_requires_canonical(active_entry),
         tts_available=_TTS_AVAILABLE,
         slplab_loaded=state["slplab_model"] is not None,
         g2p_ready=state["g2p"] is not None,
@@ -669,6 +691,7 @@ def models():
             label=m.get("label", m["id"]),
             type=m.get("type"),
             sha256=sha,
+            requires_canonical=_entry_requires_canonical(m),
         ))
     return ModelsResponse(
         active=state["active_model_id"],
@@ -843,10 +866,11 @@ async def transcribe(
         duration_sec = result["duration_sec"]
     else:
         # 블로킹 추론(STFT/CTC)을 스레드풀로 보내 이벤트 루프가 멈추지 않게 한다.
-        # canonical 인자는 PronunciationScorer 내부의 PER/alignment 계산만 트리거하므로,
-        # /transcribe 경로에서는 굳이 전달하지 않는다 (어차피 응답에서 버린다).
+        # canonical 은 FiLM 모델의 변조 조건으로 모델에 들어가야 한다 (baseline 은 무시).
+        # 전달하지 않으면 FiLM 체크포인트가 학습 분포와 어긋난 입력으로 추론돼 성능이 붕괴한다.
+        # PER/alignment 도 부수적으로 계산되지만 /transcribe 응답에서는 버린다.
         raw_result = await run_in_threadpool(
-            _score_upload, raw, None, keep_silence, audio.filename, entry_id,
+            _score_upload, raw, canonical, keep_silence, audio.filename, entry_id,
         )
         perceived = raw_result["recognized"]
         peak_softmax = raw_result.get("peak_softmax", [])

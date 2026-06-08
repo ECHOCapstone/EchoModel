@@ -89,6 +89,11 @@ class PronunciationScorer:
         self.blank_id = blank_id
         self._resamplers: Dict[int, torchaudio.transforms.Resample] = {}
 
+    @property
+    def requires_canonical(self) -> bool:
+        """추론에 canonical 음소열이 필요한지 — 모델 아키텍처가 선언한 값을 그대로 노출한다."""
+        return bool(getattr(self.model, "requires_canonical", False))
+
     @classmethod
     def from_checkpoint(
         cls,
@@ -172,15 +177,42 @@ class PronunciationScorer:
             wav = wav.mean(dim=0 if wav.shape[0] < wav.shape[1] else 1)
         return wav
 
+    def _encode_canonical(self, canonical: Optional[Union[str, Sequence[str]]]):
+        # canonical 음소열 -> (canonical_labels [1, L], canonical_lengths [1]) on device.
+        # FiLM 모델이 변조 조건으로 쓴다. baseline 모델은 forward(**kwargs) 가 무시한다.
+        # 학습(dataset._parse_phoneme_labels)과 동일하게 공백 split 후 phoneme_to_id 매핑하되,
+        # 서빙 요청이 OOV 한 토큰으로 죽지 않도록 모르는 음소는 raise 대신 건너뛴다.
+        if canonical is None:
+            return None, None
+        toks = canonical.split() if isinstance(canonical, str) else list(canonical)
+        # phoneme_to_id 는 소문자 ARPABET 인데 백엔드(g2p/LLM)는 UPPERCASE 로 보낸다.
+        # 소문자로 맞춰 조회하지 않으면 전 토큰이 OOV 로 스킵돼 FiLM 변조가 통째로 꺼진다.
+        ids = [self.phoneme_to_id[t] for t in (p.lower() for p in toks) if t in self.phoneme_to_id]
+        if not ids:
+            return None, None
+        labels = torch.tensor([ids], dtype=torch.long, device=self.device)
+        lengths = torch.tensor([len(ids)], dtype=torch.long, device=self.device)
+        return labels, lengths
+
     @torch.no_grad()
-    def _forward(self, audio: AudioInput) -> torch.Tensor:
+    def _forward(
+        self,
+        audio: AudioInput,
+        canonical: Optional[Union[str, Sequence[str]]] = None,
+    ) -> torch.Tensor:
         # 모델 추론 후 유효 프레임 길이만큼 자른 [T, V] logits 반환.
         waveform = self._load_waveform(audio).to(self.device)
         audio_len = torch.tensor([waveform.shape[0]], device=self.device)
         batch = waveform.unsqueeze(0)
         mask = create_attention_mask(batch, audio_len)
 
-        outputs = self.model(batch, attention_mask=mask)
+        canonical_labels, canonical_lengths = self._encode_canonical(canonical)
+        outputs = self.model(
+            batch,
+            attention_mask=mask,
+            canonical_labels=canonical_labels,
+            canonical_lengths=canonical_lengths,
+        )
         logits = outputs["perceived_logits"]
 
         output_lengths = self.model.encoder.wav2vec2._get_feat_extract_output_lengths(audio_len)
@@ -218,9 +250,18 @@ class PronunciationScorer:
             peak_values = [pk for _, pk in kept]
         return phonemes, peak_values
 
-    def transcribe(self, audio: AudioInput, keep_silence: bool = False) -> List[str]:
-        """Audio -> decoded phoneme sequence."""
-        logits = self._forward(audio)
+    def transcribe(
+        self,
+        audio: AudioInput,
+        keep_silence: bool = False,
+        canonical: Optional[Union[str, Sequence[str]]] = None,
+    ) -> List[str]:
+        """Audio -> decoded phoneme sequence.
+
+        canonical 은 FiLM 모델의 변조 조건으로만 쓰이며 디코딩 결과(perceived)에는 영향만 줄 뿐
+        직접 섞이지 않는다. baseline 모델에는 무시된다.
+        """
+        logits = self._forward(audio, canonical=canonical)
         phonemes, _ = self._decode(logits, keep_silence)
         return phonemes
 
@@ -260,8 +301,12 @@ class PronunciationScorer:
         canonical: Optional[Union[str, Sequence[str]]] = None,
         keep_silence: bool = False,
     ) -> Dict:
-        """End-to-end: audio -> recognized phonemes + peak softmax -> (optional) error diagnosis."""
-        logits = self._forward(audio)
+        """End-to-end: audio -> recognized phonemes + peak softmax -> (optional) error diagnosis.
+
+        canonical 이 주어지면 FiLM 모델의 변조 조건으로도 쓰인다 (baseline 은 무시). 이것이 없으면
+        FiLM 체크포인트는 학습 분포와 어긋난 입력으로 추론돼 성능이 크게 떨어진다.
+        """
+        logits = self._forward(audio, canonical=canonical)
         recognized, peaks = self._decode(logits, keep_silence)
 
         can_list: Optional[List[str]] = None
